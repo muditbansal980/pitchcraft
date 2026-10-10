@@ -1,14 +1,24 @@
 "use client";
 
 import type { ReportInput } from "@/components/report-pdf";
+import type { Deck } from "@/lib/types";
 
 export type UploadedReport = { url: string; publicId: string };
 
-/** e.g. "coca-cola-pitch-plan-2026-10-10.pdf" */
-export function reportFileName(report: { brand: string; createdAt?: string }): string {
+function fileStem(report: { brand: string; createdAt?: string }, kind: string): string {
   const slug = report.brand.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "brand";
   const date = (report.createdAt ?? new Date().toISOString()).slice(0, 10);
-  return `${slug}-pitch-plan-${date}.pdf`;
+  return `${slug}-${kind}-${date}`;
+}
+
+/** e.g. "coca-cola-pitch-plan-2026-10-10.pdf" */
+export function reportFileName(report: { brand: string; createdAt?: string }): string {
+  return `${fileStem(report, "pitch-plan")}.pdf`;
+}
+
+/** e.g. "coca-cola-pitch-deck-2026-10-10.pptx" */
+export function deckFileName(report: { brand: string; createdAt?: string }): string {
+  return `${fileStem(report, "pitch-deck")}.pptx`;
 }
 
 /** Render the report to a PDF in the browser. react-pdf is loaded only when needed. */
@@ -61,4 +71,23 @@ export async function downloadReport(report: ReportInput & { pdfUrl?: string }) 
     }
   }
   saveBlob(await renderReport(report), fileName);
+}
+
+/** Render the deck to .pptx on the backend and download it. */
+export async function downloadDeckPptx(deck: Deck, fileName: string) {
+  let res: Response;
+  try {
+    res = await fetch("/api/deck/pptx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(deck),
+    });
+  } catch {
+    throw new Error("Could not reach the server. Please try again.");
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error(data?.error ?? "Building the PPTX failed.");
+  }
+  saveBlob(await res.blob(), fileName);
 }

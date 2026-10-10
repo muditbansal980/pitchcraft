@@ -3,7 +3,7 @@
 import { useMemo, useSyncExternalStore } from "react";
 
 import { deleteUploadedReport } from "@/lib/report-files";
-import type { BrandPlan } from "@/lib/types";
+import type { BrandPlan, Deck, Visual } from "@/lib/types";
 
 // Saved in this browser only, until the backend can store researches per user.
 const STORAGE_KEY = "pitchcraft:researches";
@@ -36,17 +36,56 @@ function parse(raw: string | null): SavedResearch[] {
 }
 
 function write(items: SavedResearch[]) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items.slice(0, MAX_SAVED)));
-  } catch {
-    // Storage full or blocked: history just won't persist.
+  // Decks make entries bigger, so when storage is full drop the oldest researches
+  // (and their stored PDFs) until the rest fit, instead of saving nothing.
+  let kept = items.slice(0, MAX_SAVED);
+  while (kept.length > 0) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(kept));
+      break;
+    } catch (err) {
+      const quota = err instanceof DOMException && (err.name === "QuotaExceededError" || err.code === 22);
+      if (!quota || kept.length === 1) break; // blocked storage: history just won't persist
+      const dropped = kept.slice(Math.ceil(kept.length / 2));
+      kept = kept.slice(0, Math.ceil(kept.length / 2));
+      for (const old of dropped) {
+        if (old.pdfPublicId) deleteUploadedReport(old.pdfPublicId);
+      }
+    }
   }
   window.dispatchEvent(new Event(CHANGE_EVENT));
+}
+
+/** Keep image references as URLs only: inline (data:) images would fill localStorage. */
+function urlOnly(visual: Visual | null | undefined): Visual | null | undefined {
+  if (!visual?.url || /^(\/media\/|https?:\/\/)/i.test(visual.url)) return visual;
+  return { ...visual, url: null, kind: "placeholder" };
+}
+
+function storableDeck(deck: Deck): Deck {
+  return {
+    ...deck,
+    theme: { ...deck.theme, hero_image: urlOnly(deck.theme.hero_image) },
+    slides: deck.slides.map((slide) => {
+      switch (slide.layout) {
+        case "idea":
+          return { ...slide, visual: urlOnly(slide.visual) };
+        case "samples":
+        case "ref":
+          return { ...slide, visuals: slide.visuals.map((v) => urlOnly(v) as Visual) };
+        case "card_grid":
+          return { ...slide, cards: slide.cards.map((card) => ({ ...card, visual: urlOnly(card.visual) })) };
+        default:
+          return slide;
+      }
+    }),
+  };
 }
 
 export function saveResearch(plan: BrandPlan): SavedResearch {
   const item: SavedResearch = {
     ...plan,
+    deck: plan.deck ? storableDeck(plan.deck) : undefined,
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   };

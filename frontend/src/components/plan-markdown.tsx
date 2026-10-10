@@ -1,6 +1,8 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { mediaUrl } from "@/lib/media";
+
 // Markdown headings are shifted down two levels: the page already has an <h1>
 // and the result region an <h2>, so the plan's "# Title" renders as an <h3>.
 const components: Components = {
@@ -68,6 +70,20 @@ const components: Components = {
       {children}
     </th>
   ),
+  img: ({ src, alt }) => {
+    const url = mediaUrl(typeof src === "string" ? src : null);
+    if (!url) return alt ? <span className="italic">[{alt}]</span> : null;
+    return (
+      // eslint-disable-next-line @next/next/no-img-element -- proxied deck media of unknown size
+      <img
+        src={url}
+        alt={alt ?? ""}
+        loading="lazy"
+        decoding="async"
+        className="my-3 block h-auto max-h-[28rem] w-auto max-w-full border-3 border-foreground sm:max-w-md"
+      />
+    );
+  },
   td: ({ children, style }) => (
     <td style={style} className="border-2 border-foreground px-3 py-2 align-top">
       {children}

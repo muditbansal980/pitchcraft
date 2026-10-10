@@ -20,6 +20,16 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Open in Canva (local setup)
+
+1. Create an integration at [canva.dev](https://www.canva.dev/docs/connect/) with the scope
+   `design:content:write`, and add the redirect URL `http://127.0.0.1:3000/api/canva/callback`.
+2. Put `CANVA_CLIENT_ID` and `CANVA_CLIENT_SECRET` in `backend/.env` (no frontend env needed).
+3. **Browse the app at `http://127.0.0.1:3000`**, not `localhost:3000`. Canva only redirects to
+   `127.0.0.1`, and the login cookie is per host, so starting on `localhost` would come back logged out.
+
+Without the Canva keys, "Open in Canva" shows "Canva isn't configured"; Download PPTX still works.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

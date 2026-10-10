@@ -1,10 +1,11 @@
-import { Document, Font, Link, Page, pdf, StyleSheet, Text, View } from "@react-pdf/renderer";
-import type { ListItem, PhrasingContent, Root, RootContent, Table } from "mdast";
+import { Document, Font, Image, Link, Page, pdf, StyleSheet, Text, View } from "@react-pdf/renderer";
+import type { Image as MdImage, ListItem, Paragraph, PhrasingContent, Root, RootContent, Table } from "mdast";
 import type { ReactNode } from "react";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
 
+import { absoluteMediaUrl } from "@/lib/media";
 import type { BrandPlan } from "@/lib/types";
 
 // Client-only: imported lazily (see lib/report-files.ts) so react-pdf stays out of page bundles.
@@ -100,6 +101,8 @@ const s = StyleSheet.create({
   quote: { marginVertical: 6, paddingLeft: 10, borderLeftWidth: 4, borderLeftColor: INK, fontStyle: "italic" },
   pre: { marginVertical: 6, padding: 8, borderWidth: 2, borderColor: INK, fontFamily: "Space Mono", fontSize: 8.5 },
   hr: { marginVertical: 12, borderBottomWidth: 2, borderBottomColor: INK },
+  figure: { marginVertical: 6, flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  image: { width: 230, maxHeight: 230, objectFit: "contain", objectPosition: "left" },
   table: { marginVertical: 8, borderTopWidth: 2, borderLeftWidth: 2, borderColor: INK },
   row: { flexDirection: "row" },
   cell: { flex: 1, padding: 4, borderRightWidth: 2, borderBottomWidth: 2, borderColor: INK, fontSize: 9 },
@@ -166,13 +169,27 @@ function inline(nodes: PhrasingContent[]): ReactNode[] {
 
 const HEADING_STYLES: Record<number, (typeof s)[keyof typeof s]> = { 1: s.h1, 2: s.h2, 3: s.h3 };
 
-function listItem(item: ListItem, marker: string, key: number) {
+/** Markdown image URL -> data: URL, for the images that could be fetched (JPEG/PNG only). */
+type ImageMap = Map<string, string>;
+
+function listItem(item: ListItem, marker: string, key: number, images: ImageMap) {
   return (
     <View key={key} style={s.listItem} wrap={false}>
       <Text style={s.bullet}>{marker}</Text>
-      <View style={s.listBody}>{blocks(item.children)}</View>
+      <View style={s.listBody}>{blocks(item.children, images)}</View>
     </View>
   );
+}
+
+/** Split a paragraph into its images and the rest (deck visuals come with a "Ref:" credit line). */
+function splitImages(node: Paragraph): { imgs: MdImage[]; rest: PhrasingContent[] } {
+  const imgs: MdImage[] = [];
+  const rest: PhrasingContent[] = [];
+  for (const child of node.children) {
+    if (child.type === "image") imgs.push(child);
+    else rest.push(child);
+  }
+  return { imgs, rest };
 }
 
 function table(node: Table, key: number) {
@@ -191,7 +208,7 @@ function table(node: Table, key: number) {
   );
 }
 
-function blocks(nodes: RootContent[]): ReactNode[] {
+function blocks(nodes: RootContent[], images: ImageMap): ReactNode[] {
   return nodes.map((node, i) => {
     switch (node.type) {
       case "heading":
@@ -200,18 +217,35 @@ function blocks(nodes: RootContent[]): ReactNode[] {
             {inline(node.children)}
           </Text>
         );
-      case "paragraph":
-        return <Text key={i} style={s.p}>{inline(node.children)}</Text>;
+      case "paragraph": {
+        const { imgs, rest } = splitImages(node);
+        const loaded = imgs.filter((img) => images.has(img.url));
+        if (loaded.length === 0) return <Text key={i} style={s.p}>{inline(node.children)}</Text>;
+        // Drop the line break / whitespace left where the image was.
+        const start = rest.findIndex((c) => !(c.type === "break" || (c.type === "text" && !c.value.trim())));
+        const hasText = start !== -1;
+        return (
+          <View key={i} wrap={false}>
+            <View style={s.figure}>
+              {loaded.map((img, n) => (
+                // eslint-disable-next-line jsx-a11y/alt-text -- react-pdf Image has no alt
+                <Image key={n} src={images.get(img.url)} style={s.image} />
+              ))}
+            </View>
+            {hasText && <Text style={s.p}>{inline(rest.slice(start))}</Text>}
+          </View>
+        );
+      }
       case "list":
         return (
           <View key={i} style={s.list}>
             {node.children.map((item, n) =>
-              listItem(item, node.ordered ? `${(node.start ?? 1) + n}.` : "•", n),
+              listItem(item, node.ordered ? `${(node.start ?? 1) + n}.` : "•", n, images),
             )}
           </View>
         );
       case "blockquote":
-        return <View key={i} style={s.quote}>{blocks(node.children)}</View>;
+        return <View key={i} style={s.quote}>{blocks(node.children, images)}</View>;
       case "code":
         return <Text key={i} style={s.pre}>{clean(node.value)}</Text>;
       case "thematicBreak":
@@ -226,8 +260,9 @@ function blocks(nodes: RootContent[]): ReactNode[] {
 
 export type ReportInput = BrandPlan & { createdAt?: string };
 
-function ReportDocument({ report }: { report: ReportInput & { createdAt: string } }) {
-  const tree = unified().use(remarkParse).use(remarkGfm).parse(report.plan) as Root;
+type DocumentProps = { report: ReportInput & { createdAt: string }; tree: Root; images: ImageMap };
+
+function ReportDocument({ report, tree, images }: DocumentProps) {
   const date = new Intl.DateTimeFormat("en-GB", { dateStyle: "long" }).format(new Date(report.createdAt));
   const sections = report.research.filter((section) => section.sources.length > 0);
 
@@ -240,7 +275,7 @@ function ReportDocument({ report }: { report: ReportInput & { createdAt: string 
           <Text style={s.meta}>Generated {date}</Text>
         </View>
 
-        {blocks(tree.children)}
+        {blocks(tree.children, images)}
 
         {report.references.length > 0 && (
           <View wrap={false}>
@@ -280,8 +315,52 @@ function ReportDocument({ report }: { report: ReportInput & { createdAt: string 
   );
 }
 
+const MAX_PDF_IMAGES = 40;
+
+function collectImageUrls(node: Root | RootContent, urls: Set<string>) {
+  if (node.type === "image") urls.add(node.url);
+  if ("children" in node) for (const child of node.children) collectImageUrls(child, urls);
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Fetch the plan's images up front (through the media proxy) so one missing or
+ * unsupported image is skipped instead of breaking the PDF. react-pdf only draws JPEG and PNG.
+ */
+async function loadImages(tree: Root): Promise<ImageMap> {
+  const urls = new Set<string>();
+  collectImageUrls(tree, urls);
+  const images: ImageMap = new Map();
+  await Promise.all(
+    [...urls].slice(0, MAX_PDF_IMAGES).map(async (url) => {
+      const absolute = absoluteMediaUrl(url);
+      if (!absolute) return;
+      try {
+        const res = await fetch(absolute, { signal: AbortSignal.timeout(10_000) });
+        const blob = res.ok ? await res.blob() : null;
+        if (blob && (blob.type === "image/jpeg" || blob.type === "image/png")) {
+          images.set(url, await blobToDataUrl(blob));
+        }
+      } catch {
+        // Unreachable (or cross-origin) image: the PDF just shows it as alt text.
+      }
+    }),
+  );
+  return images;
+}
+
 export async function renderReportPdf(report: ReportInput): Promise<Blob> {
   registerFonts();
   const createdAt = report.createdAt ?? new Date().toISOString();
-  return pdf(<ReportDocument report={{ ...report, createdAt }} />).toBlob();
+  const tree = unified().use(remarkParse).use(remarkGfm).parse(report.plan) as Root;
+  const images = await loadImages(tree);
+  return pdf(<ReportDocument report={{ ...report, createdAt }} tree={tree} images={images} />).toBlob();
 }

@@ -170,6 +170,6 @@ Need a contract change? Report it to the coordinator instead of editing a file y
 - [x] Step 0 — branch, contracts (C3–C7), stubs, settings, deps (`python-pptx`, `pillow`, `cryptography`, `langchain-google-genai`, `httpx`), `/media` mount
 - [ ] Agent A — generation pipeline
 - [ ] Agent B — visuals, themes, PPTX
-- [ ] Agent C — Canva + frontend
+- [x] Agent C — Canva + frontend. **Accepted** (coordinator re-ran: eslint clean, `tsc --noEmit` clean, 12/12 Canva service mock checks, route TestClient checks). Notes: stateless Fernet-encrypted OAuth state; single-use refresh tokens serialised per user; Node fetch has a hard 300 s headers timeout so >290 s requests use `node:http`; callback uses a relative redirect to keep the 127.0.0.1 cookie. Unverified: real Canva OAuth/import (no keys), browser click-through.
 - [ ] Integration test
 - [ ] PR
