@@ -1,0 +1,45 @@
+# Hackathon data (not for redistribution)
+04-PitchCraft/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Environment files (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# ---------- Backend (Python) ----------
+__pycache__/
+*.py[oc]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.db
+*.sqlite3
+
+# ---------- Frontend (Next.js) ----------
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
