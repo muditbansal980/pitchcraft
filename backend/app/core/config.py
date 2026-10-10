@@ -33,15 +33,21 @@ class Settings(BaseSettings):
     # per model and Gemini has its own quota, so spreading roles saves the free tiers.
     # Set as JSON in .env, e.g. LLM_ROLES='{"writer": ["groq:openai/gpt-oss-120b"]}'.
     llm_roles: dict[str, list[str]] = {
-        "strategist": ["gemini:gemini-flash-latest", "groq:openai/gpt-oss-120b"],
+        "strategist": ["gemini:gemini-3.8-flash", "groq:openai/gpt-oss-120b", "groq:openai/gpt-oss-20b"],
         "writer": [
             "groq:openai/gpt-oss-120b",
-            "groq:qwen/qwen3.8-27b",
             "groq:openai/gpt-oss-20b",
-            "gemini:gemini-flash-lite-latest",
+            # Free tier caps qwen output at ~1K tokens/min, so it only takes small calls.
+            "groq:qwen/qwen3.8-27b",
+            "gemini:gemini-3.5-flash-lite",
         ],
-        "editor": ["gemini:gemini-flash-latest", "groq:openai/gpt-oss-120b"],
-        "vision": ["gemini:gemini-flash-latest"],
+        "editor": [
+            "gemini:gemini-3.8-flash",
+            "groq:openai/gpt-oss-120b",
+            "groq:openai/gpt-oss-20b",
+            "groq:qwen/qwen3.8-27b",
+        ],
+        "vision": ["gemini:gemini-3.8-flash"],
     }
     # Optional per-model overrides of the router's built-in free-tier limits:
     # {"groq:openai/gpt-oss-120b": {"tpm": 8000, "rpm": 30, "tpd": 200000}}.
