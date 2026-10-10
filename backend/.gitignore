@@ -13,3 +13,4 @@ wheels/
 .env
 *.db
 chroma_data/
+media/

@@ -122,3 +122,54 @@ Open items:
 - `frontend/src/app/layout.tsx` description still says "Look up brand info for pitches" (user-owned file, not changed)
 - npm reported audit warnings when installing react-markdown (not investigated)
 - Free tier: two plans within a minute may hit Groq's 8K tokens/min limit → 429 with a "try again in a minute" message
+
+---
+
+# v2 — Designed pitch decks (branch `feature/pitchcraft-v2`)
+
+Full plan: variable-size decks (focused 6–10 / standard 15–22 / flagship 30–45 slides), multi-model LLM routing (Groq pool + Gemini), visuals (Reddit, Tavily images, Imgflip, AI mocks, Gemini vision picking), themes, PPTX export, Canva import. Coordinator: main Claude session (contracts, review, integration, PR).
+
+## v2 contracts
+
+### C3 (updated) — `POST /api/brand-plan`
+Request `{"brand": str, "brief"?: str (≤2000), "scale"?: "auto"|"focused"|"standard"|"flagship"}`.
+Response adds `scale` (resolved), `brief`, `deck: Deck` (`plan` Markdown is now derived from `deck`). Errors unchanged; 429 only when every model for a role is exhausted.
+
+### C4 — Deck schema: `backend/app/schemas/deck.py`
+`Deck{title, brand, scale, theme: Theme, slides: [Slide]}`; `Slide` is a discriminated union on `layout` (`SLIDE_LAYOUTS`). Text is clipped, lists truncated, never rejected for length. `Visual` = request fields (`want`, `brief`, `query`, `meme_template_id`, `meme_boxes`, written by LLM) + result fields (`kind`, `url` = `/media/<file>`, `source_url`, `credit`, written by visuals). Frontend mirrors it in `frontend/src/lib/types.ts`.
+
+### C5 — Deck/Canva endpoints
+- `POST /api/deck/pptx` body `Deck` → `application/vnd.openxmlformats-officedocument.presentationml.presentation` (attachment).
+- `GET /api/canva/status` → `{connected, configured}`; `GET /api/canva/authorize` → `{url}`; `POST /api/canva/callback` `{code, state}` → `{connected: true}`; `DELETE /api/canva/connection` → 204; `POST /api/canva/import` body `Deck` → `{edit_url, view_url}`.
+- All require the logged-in user (`CurrentUser`), FastAPI `{detail}` errors (503 when the feature's keys are missing).
+- `GET /media/<file>` static images (no auth).
+
+### C6 — LLM router: `backend/app/services/llm_router.py`
+`invoke_text(role, messages, *, max_tokens, temperature, prefer)`, `invoke_json(role, messages, schema, ...)`, `invoke_vision_json(prompt, images) -> dict | None`, `LLMUnavailableError`. Roles: strategist, writer, editor, vision (`settings.llm_roles`). `prefer=i` rotates the model list so parallel writers hit different models.
+
+### C7 — Visuals / themes / render
+- `media.save_image(bytes) -> "/media/<sha1>.jpg"`, `media.resolve_media(url) -> Path | None`
+- `trends.get_trend_pulse(extra_subreddits) -> TrendPulse`, `trends.search_reddit_images(query, limit)`
+- `visuals.get_meme_templates() -> [MemeTemplate{id, name, box_count}]`, `visuals.attach_visuals(deck, VisualBudget{ref, meme, mock}) -> Deck`
+- `themes.THEME_DESCRIPTIONS`, `themes.ThemeChoice{name, accent_hint, hero_prompt}`, `themes.probe_brand_colors(brand) -> [hex]`, `themes.resolve_theme(choice, brand_colors) -> Theme`
+- `deck_render.render_deck(deck) -> bytes` (sync), `PPTX_MIME`
+- Stubs return safe empty defaults (except `render_deck`, `save_image`, `resolve_media`, `invoke_*`) so agents can build in parallel.
+
+## v2 agent assignments (exclusive file ownership, no commits by agents)
+
+| Agent | Owns |
+|---|---|
+| A — LLM + generation | `services/llm_router.py`, `services/brand_plan.py`, `services/retrieval.py`, `api/routes/plan.py` |
+| B — Visuals + themes + PPTX | `services/media.py`, `services/visuals.py`, `services/trends.py`, `services/themes.py`, `services/deck_render.py`, `api/routes/deck.py` |
+| C — Canva + frontend | `api/routes/canva.py`, `services/canva.py`, `models/canva_token.py`, `models/__init__.py`, `alembic/versions/*` (new), everything in `frontend/` |
+| Coordinator | `schemas/*`, `core/config.py`, `main.py`, `.env.example`, `pyproject.toml`/`uv.lock`, `WORKPLAN.md` |
+
+Need a contract change? Report it to the coordinator instead of editing a file you don't own.
+
+## v2 progress log
+- [x] Step 0 — branch, contracts (C3–C7), stubs, settings, deps (`python-pptx`, `pillow`, `cryptography`, `langchain-google-genai`, `httpx`), `/media` mount
+- [ ] Agent A — generation pipeline
+- [ ] Agent B — visuals, themes, PPTX
+- [ ] Agent C — Canva + frontend
+- [ ] Integration test
+- [ ] PR
