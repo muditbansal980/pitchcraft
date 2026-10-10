@@ -1,4 +1,4 @@
-import { endSession, getSessionToken } from "@/lib/session";
+import { endSession, getSessionToken, type SessionUser } from "@/lib/session";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
@@ -90,4 +90,25 @@ export async function forwardBrandRequest(request: Request, options: ForwardOpti
     return Response.json({ error: result.error }, { status: result.status });
   }
   return Response.json(result.data);
+}
+
+/**
+ * The logged-in user as confirmed by the backend (`GET /api/auth/me` validates the JWT).
+ * Use this, not `getSessionUser()`, when the user's identity authorises an action:
+ * the `pc_user` cookie is only a display copy and isn't signed.
+ */
+export async function getVerifiedUser(): Promise<SessionUser | null> {
+  const token = await getSessionToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    const user = await res.json();
+    return typeof user?.id === "number" && typeof user?.username === "string" ? user : null;
+  } catch {
+    return null;
+  }
 }

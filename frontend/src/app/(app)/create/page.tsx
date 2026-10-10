@@ -6,7 +6,7 @@ import { useRef, useState } from "react";
 import { LoginRequiredDialog } from "@/components/login-required-dialog";
 import { PlanMarkdown } from "@/components/plan-markdown";
 import { ResearchSources } from "@/components/research-sources";
-import { renderReport, reportFileName, uploadReport } from "@/lib/report-files";
+import { deleteUploadedReport, renderReport, reportFileName, uploadReport } from "@/lib/report-files";
 import { saveResearch, updateResearch, type SavedResearch } from "@/lib/researches";
 import type { BrandPlan } from "@/lib/types";
 
@@ -72,7 +72,8 @@ export default function CreatePage() {
     try {
       const pdf = await renderReport(saved);
       const { url, publicId } = await uploadReport(pdf, reportFileName(saved));
-      updateResearch(saved.id, { pdfUrl: url, pdfPublicId: publicId });
+      // Deleted from Your researches while uploading: don't leave the file behind.
+      if (!updateResearch(saved.id, { pdfUrl: url, pdfPublicId: publicId })) deleteUploadedReport(publicId);
       if (job === pdfJob.current) setPdfStatus({ state: "saved" });
     } catch (err) {
       const error = err instanceof Error ? err.message : "Saving the PDF failed.";

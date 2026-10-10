@@ -1,18 +1,24 @@
 import multer from "multer";
 
+import { getVerifiedUser } from "@/lib/backend";
 import { CloudinaryConfigError, deletePdf, uploadPdf, userReportsFolder } from "@/lib/cloudinary";
 import { readSingleFile } from "@/lib/multer";
-import { getSessionUser } from "@/lib/session";
 
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
+// Multipart framing around the file; lets oversized uploads be refused before reading them.
+const MULTIPART_OVERHEAD_BYTES = 64 * 1024;
 
 class InvalidFileError extends Error {}
 
 /** Upload a report PDF (multipart field `file`) to Cloudinary. Returns `{url, publicId}`. */
 export async function POST(request: Request) {
-  const user = await getSessionUser();
+  const user = await getVerifiedUser();
   if (!user) {
     return Response.json({ error: "Log in to save reports." }, { status: 401 });
+  }
+
+  if (Number(request.headers.get("content-length")) > MAX_PDF_BYTES + MULTIPART_OVERHEAD_BYTES) {
+    return Response.json({ error: "The PDF is too large (max 10 MB)." }, { status: 413 });
   }
 
   let file: Express.Multer.File | undefined;
@@ -63,7 +69,7 @@ export async function POST(request: Request) {
 
 /** Delete one of the current user's report PDFs: body `{publicId}`. */
 export async function DELETE(request: Request) {
-  const user = await getSessionUser();
+  const user = await getVerifiedUser();
   if (!user) {
     return Response.json({ error: "Log in to manage reports." }, { status: 401 });
   }
