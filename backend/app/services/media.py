@@ -24,7 +24,7 @@ MAX_INPUT_BYTES = 15 * 1024 * 1024
 MAX_PIXELS = 40_000_000
 JPEG_QUALITY = 86
 
-_FILE_RE = re.compile(r"^[0-9a-f]{40}\.jpg$")
+_FILE_RE = re.compile(r"^[0-9a-f]{40}\.(?:jpg|png)$")
 
 
 def media_root() -> Path:
@@ -90,12 +90,46 @@ def save_image(data: bytes) -> str:
     return MEDIA_URL_PREFIX + name
 
 
+def save_png(data: bytes, max_side: int = 800) -> str:
+    """Store an image as PNG keeping its transparency (logos); return its ``/media/<sha1>.png`` URL.
+
+    Raises ValueError if ``data`` is not a usable image.
+    """
+    if not data or len(data) > MAX_INPUT_BYTES:
+        raise ValueError("empty or oversized image data")
+    name = f"{image_digest(data)}.png"
+    target = media_root() / name
+    if target.is_file():
+        return MEDIA_URL_PREFIX + name
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            img = Image.open(io.BytesIO(data))
+            if img.width * img.height > MAX_PIXELS:
+                raise ValueError("image has too many pixels")
+            img.seek(0)
+            img.load()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"not a usable image: {exc.__class__.__name__}") from exc
+    if min(img.size) < 16:
+        raise ValueError("image too small")
+    img = img.convert("RGBA")
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    tmp = target.with_suffix(".tmp")
+    img.save(tmp, "PNG", optimize=True)
+    tmp.replace(target)
+    return MEDIA_URL_PREFIX + name
+
+
 def resolve_media(url: str | None) -> Path | None:
     """Local file for a ``/media/...`` URL, or None if it is not a stored media file.
 
-    Accepts ``/media/<sha1>.jpg`` and absolute/proxied forms ending in ``/media/<sha1>.jpg``
+    Accepts ``/media/<sha1>.jpg|png`` and absolute/proxied forms ending in ``/media/<file>``
     (e.g. ``http://host/media/x.jpg``, ``/api/media/x.jpg``). The file name must be a
-    sha1 + ``.jpg``, so no path can escape the media directory.
+    sha1 + ``.jpg``/``.png``, so no path can escape the media directory.
     """
     if not url or not isinstance(url, str):
         return None

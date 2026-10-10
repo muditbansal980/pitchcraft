@@ -9,10 +9,18 @@ Fills every ``Visual`` request in a deck:
 Results go through ``media.save_image``. Anything that fails stays a
 placeholder; this module never raises for a single bad visual.
 
+Memes (``memes.py``): templates come from a fresh, trend-weighted shortlist; a
+template repeated within the deck or used in the last few decks is swapped for
+the best unused one with the same box count, and every deck's templates are
+recorded in ``{media_dir}/meme_history.json``. ``MemeTemplate`` and
+``get_meme_templates`` are re-exported here for existing callers.
+
 Fallbacks when a source is unavailable (verified 2026-10):
-- Imgflip captioning needs an account. Without one, popular templates whose
-  caption fits a top band are captioned locally (Pillow, "caption band" meme
-  format) from Imgflip's public template image.
+- Imgflip captioning needs an account. Without one, templates are captioned
+  locally (``memes_layouts``: measured boxes for ~46 popular templates, classic
+  outlined top/bottom text, else a caption band). A meme slot without a
+  template becomes a generated meme-format scene (when an image model works)
+  or a credited real meme image (Ref).
 - Pollinations' anonymous endpoint now answers 402 (payment required). When no
   image generator works, a non-hero mock falls back to a web reference image
   for its brief (labelled ``kind="ref"`` with its source), the way the WLDD
@@ -32,12 +40,11 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageChops
 from pydantic import BaseModel
 from tavily import AsyncTavilyClient
 
@@ -45,6 +52,16 @@ from app.core.config import settings
 from app.schemas.deck import Deck, Visual
 from app.services import llm_router, trends
 from app.services.media import image_digest, resolve_media, save_image
+from app.services.memes import (  # re-exported: callers import these from visuals
+    MemeTemplate,
+    choose_replacement,
+    get_meme_templates,
+    meme_shortlist,
+    recently_used,
+    record_meme_use,
+    template_image_urls,
+)
+from app.services.memes_layouts import render_meme
 from app.services.visuals_http import FetchedImage, fetch_image, new_client
 from app.services.visuals_safety import is_safe_text
 
@@ -54,19 +71,10 @@ OVERALL_TIMEOUT = 45.0
 SLOT_TIMEOUT = 30.0
 MAX_REF_CANDIDATES = 6
 MIN_REF_SIDE = 240
-TEMPLATE_TTL = 6 * 3600.0
 MOCK_FALLBACK_TO_REF = True
 
 MOCK_STYLE = "Instagram reel thumbnail, Indian context, photorealistic, no text, no logos, no watermark"
 HERO_STYLE = "wide 16:9 background photo, strong negative space, dark tones, no text, no logos, no watermark"
-
-
-@dataclass(frozen=True)
-class MemeTemplate:
-    id: str
-    name: str
-    box_count: int
-    url: str = ""  # blank template image (Imgflip CDN)
 
 
 @dataclass(frozen=True)
@@ -98,36 +106,6 @@ class _Slot:
     want: str
     is_hero: bool = False
     candidates: list[_Candidate] = field(default_factory=list)
-
-
-# --- Imgflip templates ------------------------------------------------------
-
-_templates: tuple[float, list[MemeTemplate]] | None = None
-
-
-async def get_meme_templates() -> list[MemeTemplate]:
-    """Imgflip's currently popular templates (cached ~6 h). Empty list on failure."""
-    global _templates
-    if _templates and _templates[0] > time.monotonic():
-        return _templates[1]
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get("https://api.imgflip.com/get_memes")
-            resp.raise_for_status()
-            body = resp.json()
-        memes = (body.get("data") or {}).get("memes") or [] if body.get("success") else []
-        out = [
-            MemeTemplate(id=str(m["id"]), name=str(m["name"]), box_count=int(m.get("box_count") or 2),
-                         url=str(m.get("url") or ""))
-            for m in memes
-            if m.get("id") and m.get("name")
-        ]
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-        logger.warning("Imgflip get_memes failed: %s", exc)
-        return _templates[1] if _templates else []
-    if out:
-        _templates = (time.monotonic() + TEMPLATE_TTL, out)
-    return out
 
 
 # --- helpers ----------------------------------------------------------------
@@ -229,6 +207,8 @@ class _Ctx:
     sem_gen: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(3))
     mock_dead: set[str] = field(default_factory=set)
     logged: set[str] = field(default_factory=set)
+    motif: str = ""
+    season_words: str = ""
 
     def log_once(self, key: str, msg: str, *args: Any) -> None:
         if key not in self.logged:
@@ -397,137 +377,82 @@ async def _imgflip_caption(ctx: _Ctx, template_id: str, boxes: list[str]) -> _Ca
                       credit=f"Brand meme, Imgflip template: {name.name if name else template_id}"[:120])
 
 
-def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/Library/Fonts/Arial Bold.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
-    ):
-        if Path(path).is_file():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default(size=size)
-
-
-def _wrap(draw: ImageDraw.ImageDraw, text: str, font, width: int) -> list[str]:
-    lines: list[str] = []
-    for para in text.split("\n"):
-        line = ""
-        for word in para.split():
-            trial = f"{line} {word}".strip()
-            if draw.textlength(trial, font=font) <= width or not line:
-                line = trial
-            else:
-                lines.append(line)
-                line = word
-        if line:
-            lines.append(line)
-    return lines
-
-
-# Templates whose captions belong inside panels: box rectangles as fractions (x0, y0, x1, y1).
-PANEL_LAYOUTS: dict[str, list[tuple[float, float, float, float]]] = {
-    "181913649": [(0.52, 0.03, 0.97, 0.47), (0.52, 0.53, 0.97, 0.97)],  # Drake Hotline Bling
-}
-
-
-def panel_meme(template: bytes, boxes: list[str], layout: list[tuple[float, float, float, float]]) -> bytes:
-    """Write each caption centred inside its panel (black on the template's white panels)."""
-    with Image.open(io.BytesIO(template)) as src:
-        img = src.convert("RGB")
-    img.thumbnail((1000, 1000))
-    draw = ImageDraw.Draw(img)
-    for caption, (fx0, fy0, fx1, fy1) in zip(boxes, layout, strict=False):
-        x0, y0, x1, y1 = fx0 * img.width, fy0 * img.height, fx1 * img.width, fy1 * img.height
-        bw, bh = x1 - x0, y1 - y0
-        size = int(bh / 4)
-        while True:
-            font = _font(size)
-            lines = _wrap(draw, caption.strip(), font, int(bw))
-            if (len(lines) * size * 1.2 <= bh and all(draw.textlength(ln, font=font) <= bw for ln in lines)) \
-                    or size <= 14:
-                break
-            size -= 2
-        y = y0 + (bh - len(lines) * size * 1.2) / 2
-        for line in lines:
-            lw = draw.textlength(line, font=font)
-            draw.text((x0 + (bw - lw) / 2, y), line, font=font, fill=(0, 0, 0))
-            y += size * 1.2
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=90)
-    return buf.getvalue()
-
-
-def caption_band_meme(template: bytes, boxes: list[str]) -> bytes:
-    """Classic "caption above the picture" meme: white band with bold black text over the template."""
-    with Image.open(io.BytesIO(template)) as src:
-        img = src.convert("RGB")
-    img.thumbnail((900, 900))
-    w = img.width
-    pad = max(18, w // 28)
-    text = "\n".join(b.strip() for b in boxes if b.strip())
-    probe = ImageDraw.Draw(img)
-    size = max(22, w // 16)
-    while True:
-        font = _font(size)
-        lines = _wrap(probe, text, font, w - 2 * pad)
-        if len(lines) <= 5 or size <= 18:
-            break
-        size -= 2
-    line_h = int(size * 1.25)
-    band = pad * 2 + line_h * len(lines)
-    out = Image.new("RGB", (w, img.height + band), "white")
-    out.paste(img, (0, band))
-    draw = ImageDraw.Draw(out)
-    y = pad
-    for line in lines:
-        draw.text((pad, y), line, font=font, fill=(0, 0, 0))
-        y += line_h
-    buf = io.BytesIO()
-    out.save(buf, "JPEG", quality=90)
-    return buf.getvalue()
-
-
-async def _meme(ctx: _Ctx, v: Visual) -> _Candidate | None:
+async def _meme(ctx: _Ctx, v: Visual) -> list[_Candidate]:
     boxes = [b for b in v.meme_boxes if b and b.strip()]
     tid = (v.meme_template_id or "").strip()
-    if not tid or not boxes:
-        return None
-    if not is_safe_text(*boxes):
+    if boxes and not is_safe_text(*boxes):
         logger.info("visuals: meme caption failed the safety filter; left as placeholder")
-        return None
+        return []
+    if not tid or not boxes:
+        return await _meme_without_template(ctx, v, boxes)
     if settings.imgflip_username and settings.imgflip_password:
         made = await _imgflip_caption(ctx, tid, boxes)
         if made:
-            return made
+            return [made]
     else:
         ctx.log_once("imgflip", "visuals: Imgflip credentials missing; captioning templates locally")
     tpl = ctx.templates.get(tid)
     if not tpl or not tpl.url:
-        return None
-    img = await _download(ctx, tpl.url)
+        return []
+    img = None
+    for url in template_image_urls(tpl):
+        img = await _download(ctx, url)
+        if img:
+            break
     if not img:
-        return None
+        return []
     try:
-        layout = PANEL_LAYOUTS.get(tid)
-        if layout and len(boxes) <= len(layout):
-            data = await asyncio.to_thread(panel_meme, img.data, boxes, layout)
-        else:
-            data = await asyncio.to_thread(caption_band_meme, img.data, boxes)
-    except Exception as exc:
+        data = await asyncio.to_thread(render_meme, img.data, tid, boxes, tpl.box_count)
+    except Exception as exc:  # noqa: BLE001 - one bad meme never breaks the deck
         logger.info("visuals: local meme caption failed: %s", exc)
-        return None
-    return _Candidate(data=data, mime="image/jpeg", kind="meme", source_url=tpl.url,
-                      credit=f"Brand meme, template: {tpl.name}"[:120])
+        return []
+    return [_Candidate(data=data, mime="image/jpeg", kind="meme", source_url=tpl.url,
+                       credit=f"Brand meme, template: {tpl.name}"[:120])]
+
+
+async def _meme_without_template(ctx: _Ctx, v: Visual, boxes: list[str]) -> list[_Candidate]:
+    """No template: a generated brand scene in meme format (when an image model works), else real
+    trending meme images for the brief as credited refs."""
+    if v.brief and _generator_ready() and "generator" not in ctx.mock_dead:
+        motif = f", featuring {ctx.motif}" if ctx.motif else ""
+        scene = Visual(want="mock", brief=f"meme-format reaction photo: {v.brief}{motif}, expressive faces")
+        made = await _mock(ctx, scene, hero=False, fallback=False)
+        if made:
+            cand = made[0]
+            if boxes:
+                try:
+                    cand.data = await asyncio.to_thread(render_meme, cand.data, "", boxes, len(boxes))
+                except Exception:  # noqa: BLE001
+                    pass
+            cand.kind, cand.credit = "meme", "Brand meme (AI scene)"
+            return [cand]
+    query = (v.query or v.brief or "").strip()
+    if not query:
+        return []
+    ref = Visual(want="ref", brief=v.brief, query=f"{query} meme")
+    return await _ref_candidates(ctx, ref, kind="ref")
 
 
 # --- AI mocks ---------------------------------------------------------------
 
 
+def _generator_ready() -> bool:
+    if settings.image_gen_provider == "cloudflare":
+        return bool(settings.cloudflare_account_id and settings.cloudflare_api_token)
+    if settings.image_gen_provider == "pollinations":
+        return bool(getattr(settings, "pollinations_api_key", None))
+    return False
+
+
 def _mock_prompt(ctx: _Ctx, v: Visual, hero: bool) -> str:
-    base = " ".join((v.brief or v.query or "").split())[:260]
-    return f"{base}. {HERO_STYLE if hero else MOCK_STYLE}"
+    base = " ".join((v.brief or v.query or "").split())[:240]
+    extra = []
+    if ctx.motif and not hero and ctx.motif.split(",")[0].strip().lower() not in base.lower():
+        extra.append(f"brand world: {ctx.motif}")
+    if ctx.season_words and not hero:
+        extra.append(ctx.season_words)
+    tail = (", " + ", ".join(extra)) if extra else ""
+    return f"{base}{tail}. {HERO_STYLE if hero else MOCK_STYLE}"
 
 
 async def _pollinations(ctx: _Ctx, prompt: str, hero: bool) -> bytes | None:
@@ -585,7 +510,7 @@ async def _cloudflare(ctx: _Ctx, prompt: str) -> bytes | None:
         return None
 
 
-async def _mock(ctx: _Ctx, v: Visual, hero: bool) -> list[_Candidate]:
+async def _mock(ctx: _Ctx, v: Visual, hero: bool, fallback: bool = True) -> list[_Candidate]:
     provider = settings.image_gen_provider
     prompt = _mock_prompt(ctx, v, hero)
     data = None
@@ -598,7 +523,7 @@ async def _mock(ctx: _Ctx, v: Visual, hero: bool) -> list[_Candidate]:
         label = "FLUX schnell" if provider == "cloudflare" else "Pollinations"
         return [_Candidate(data=data, mime="image/jpeg", kind="mock", source_url="",
                            credit=f"AI mock ({label})", caption=v.brief[:200])]
-    if hero or not MOCK_FALLBACK_TO_REF:
+    if hero or not fallback or not MOCK_FALLBACK_TO_REF:
         return []
     return await _ref_candidates(ctx, v, kind="ref")
 
@@ -611,13 +536,48 @@ async def _fill(ctx: _Ctx, slot: _Slot) -> None:
         if slot.want == "ref":
             slot.candidates = await _ref_candidates(ctx, slot.visual)
         elif slot.want == "meme":
-            made = await _meme(ctx, slot.visual)
-            slot.candidates = [made] if made else []
+            slot.candidates = await _meme(ctx, slot.visual)
         else:
             slot.candidates = await _mock(ctx, slot.visual, slot.is_hero)
     except Exception:  # one bad visual must never break the deck
         logger.exception("visuals: slot failed (%s: %s)", slot.want, slot.visual.brief[:60])
         slot.candidates = []
+
+
+def _season_words(season: str | None) -> str:
+    from app.services.brand_identity_season import get_season
+
+    sea = get_season(season)
+    return ", ".join(sea.prompt.split(", ")[:3]) if sea else ""
+
+
+async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str, MemeTemplate]) -> None:
+    """No template twice in a deck, none from the last few decks: swap for the best unused
+    template with the same box count from a fresh shortlist (captions carry over)."""
+    hints = [s.visual.brief or s.visual.query or "" for s in meme_slots]
+    shortlist = await meme_shortlist(deck.brand, hints, n=30)
+    for t in shortlist:
+        templates.setdefault(t.id, t)
+    recent = recently_used(deck.brand)
+    used: set[str] = set()
+    for slot in meme_slots:
+        v = slot.visual
+        boxes = [b for b in v.meme_boxes if b and b.strip()]
+        tid = (v.meme_template_id or "").strip()
+        if not boxes:
+            continue
+        current = templates.get(tid)
+        bad = (not current) or tid in used or tid in recent or (current and current.box_count < len(boxes))
+        if bad:
+            repl = choose_replacement(current, current.box_count if current else len(boxes), used, recent,
+                                      shortlist, v.brief or "")
+            if repl is None and current is None:
+                continue
+            if repl is not None:
+                logger.info("visuals: meme template %s -> %s (%s)", tid or "-", repl.id, repl.name)
+                v.meme_template_id = repl.id
+                tid = repl.id
+        used.add(tid)
 
 
 def _select_slots(deck: Deck, budget: VisualBudget) -> list[_Slot]:
@@ -650,8 +610,13 @@ async def attach_visuals(deck: Deck, budget: VisualBudget) -> Deck:
     async with new_client(timeout=10) as client:
         templates: dict[str, MemeTemplate] = {}
         pulse: list[trends.TrendPost] = []
-        if any(s.want == "meme" for s in slots):
+        meme_slots = [s for s in slots if s.want == "meme"]
+        if meme_slots:
             templates = {t.id: t for t in await get_meme_templates()}
+            try:
+                await asyncio.wait_for(_plan_memes(deck, meme_slots, templates), timeout=15)
+            except Exception as exc:  # noqa: BLE001 - keep the writer's templates
+                logger.info("visuals: meme planning skipped (%s)", exc.__class__.__name__)
         if any(s.want in ("ref", "mock") for s in slots):
             try:
                 pulse = (await asyncio.wait_for(trends.get_trend_pulse(), timeout=12)).posts
@@ -661,6 +626,7 @@ async def attach_visuals(deck: Deck, budget: VisualBudget) -> Deck:
             client=client,
             tavily=AsyncTavilyClient(api_key=settings.tavily_api_key) if settings.tavily_api_key else None,
             pulse=pulse, templates=templates, theme_name=deck.theme.name,
+            motif=deck.theme.motif or "", season_words=_season_words(deck.theme.season),
         )
         tasks = [asyncio.create_task(asyncio.wait_for(_fill(ctx, s), SLOT_TIMEOUT)) for s in slots]
         remaining = max(5.0, OVERALL_TIMEOUT - (time.monotonic() - started))
@@ -692,6 +658,10 @@ async def attach_visuals(deck: Deck, budget: VisualBudget) -> Deck:
             v.credit = cand.credit or None
             filled[cand.kind if cand.kind in filled else "mock"] += 1
             break
+    meme_ids = [s.visual.meme_template_id for s in slots
+                if s.want == "meme" and s.visual.kind == "meme" and s.visual.meme_template_id]
+    if meme_ids:
+        record_meme_use(deck.brand, meme_ids)
     logger.info(
         "visuals: %d slots, filled ref=%d meme=%d mock=%d, %d left as placeholders, %.1fs",
         len(slots), filled["ref"], filled["meme"], filled["mock"],

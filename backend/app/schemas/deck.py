@@ -224,7 +224,15 @@ class Theme(BaseModel):
     muted: HexColor = "#B3B3B3"
     heading_font: str = "Anton"
     body_font: str = "Montserrat"
-    hero_image: Visual | None = Field(None, description="Cover/divider background (AI mock)")
+    hero_image: Visual | None = Field(None, description="Cover/divider background (AI mock or brand product image)")
+    # Brand identity (from the brand's website/logo) and campaign moment.
+    logo: Visual | None = Field(None, description="Brand logo, shown on cover/fin")
+    motif: Text(160) = Field("", description='Brand objects/visual motifs, e.g. "coffee beans, owl, steam swirls"')
+    season: Text(40) | None = Field(None, description='Campaign moment, e.g. "diwali", "ipl", "monsoon"')
+    decor: Literal["none", "dots", "stripes", "waves", "grain", "confetti", "diyas", "pitch_lines", "film_grain"] = Field(
+        "none", description="Decorative pattern layer the renderer draws, chosen from motif/season"
+    )
+    identity_source: str | None = Field(None, description="Website the palette/fonts were taken from")
 
 
 class Deck(BaseModel):

@@ -48,8 +48,20 @@ def _load_metrics() -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, f
 _FONTS, _FALLBACK = _load_metrics()
 
 
+_CATEGORY_STAND_IN = {
+    "geometric": "montserrat", "humanist": "open sans", "grotesk": "inter", "condensed": "oswald",
+    "slab": "roboto slab", "serif": "lora", "didone": "playfair display", "rounded": "nunito",
+    "script": "pacifico", "display": "archivo black",
+}
+
+
 def _widths(font: str, bold: bool) -> dict[str, float]:
-    fam = _FONTS.get((font or "").strip().lower()) or _FONTS.get("montserrat")
+    key = (font or "").strip().lower()
+    fam = _FONTS.get(key)
+    if not fam:  # an unknown font: use a stand-in of the same kind (condensed, serif, ...)
+        from app.services.brand_identity_fonts import classify
+
+        fam = _FONTS.get(_CATEGORY_STAND_IN.get(classify(key) or "", "montserrat")) or _FONTS.get("montserrat")
     if not fam:
         return _FALLBACK
     return fam.get("bold" if bold else "regular") or fam.get("regular") or _FALLBACK

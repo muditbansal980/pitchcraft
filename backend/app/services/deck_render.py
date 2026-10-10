@@ -42,6 +42,8 @@ from app.schemas.deck import (
     TwoColumnSlide,
     Visual,
 )
+from app.services.brand_identity_fonts import font_info
+from app.services.deck_render_decor import draw_decor
 from app.services.deck_render_kit import (
     Run,
     box,
@@ -107,12 +109,16 @@ def make_look(theme: Theme) -> Look:
     head = theme.accent if name in ("bold_dark", "sport_energy") else theme.text
     if contrast(head, theme.bg) < 4.5:
         head = theme.text
+    hinfo = font_info(theme.heading_font)
+    script = hinfo.category == "script"
     return Look(
         t=theme,
         dark=dark,
-        upper=name in ("bold_dark", "cinematic", "sport_energy", "pop_meme"),
-        italic=name in ("bold_dark", "sport_energy"),
-        head_bold=(theme.heading_font or "").strip().lower() not in _SINGLE_WEIGHT,
+        # Brand script/serif faces keep their own casing; the preset sets it otherwise.
+        upper=name in ("bold_dark", "cinematic", "sport_energy", "pop_meme") and not script
+        and hinfo.category not in ("serif",),
+        italic=name in ("bold_dark", "sport_energy") and not script and hinfo.category not in ("serif", "didone"),
+        head_bold=hinfo.bold and (theme.heading_font or "").strip().lower() not in _SINGLE_WEIGHT,
         head_color=head,
         on_accent=on_color(theme.accent),
         line=mix(theme.surface, theme.accent, 0.45) if dark else mix(theme.surface, theme.text, 0.18),
@@ -130,6 +136,7 @@ class Ctx:
     credits: list[str] = field(default_factory=list)
     prev_hero: bool = False  # the previous slide used the hero image
     used_hero: bool = False
+    strong_decor: bool = False  # cover/divider/fin show the full decor pattern
 
 
 # --- shared pieces ----------------------------------------------------------
@@ -145,7 +152,9 @@ def _background(slide, ctx: Ctx, *, glow_side: str = "right") -> None:
         set_gradient(g, [(0, t.bg, 0.0), (0.45, t.bg, 0.0), (1, mix(t.bg, t.accent, 0.42), 0.55)], ang)
         v = box(slide, 0, 0, W, H, t.bg)
         set_gradient(v, [(0, t.bg, 0.0), (0.6, t.bg, 0.0), (1, t.bg, 0.65)], 90)
-    if t.name == "sport_energy":
+    if t.decor and t.decor != "none":
+        draw_decor(slide, t, strong=ctx.strong_decor, seed=ctx.index)
+    elif t.name == "sport_energy":
         box(slide, W - 4.4, -0.2, 2.4, H + 0.4, t.accent, alpha=0.07, shape=MSO_SHAPE.PARALLELOGRAM, adj=0.45)
         box(slide, W - 2.6, -0.2, 0.5, H + 0.4, t.accent_2, alpha=0.06, shape=MSO_SHAPE.PARALLELOGRAM, adj=0.45)
     elif t.name == "pop_meme":
@@ -174,11 +183,63 @@ def _hero_background(slide, ctx: Ctx, overlay: float, *, optional: bool = False)
     if pic is None:
         return False
     if overlay > 0:
+        if not ctx.look.dark:
+            overlay = max(overlay, 0.8)  # light themes need more wash for dark text to read
         box(slide, 0, 0, W, H, t.bg, alpha=overlay)
+    if t.decor and t.decor not in ("none", "grain"):
+        draw_decor(slide, t, strong=False, seed=ctx.index)
     if hero.credit:
         ctx.credits.append(f"Background: {hero.credit}")
     ctx.used_hero = True
     return True
+
+
+def _logo_stats(path) -> tuple[float, float] | None:
+    """(mean luminance of the logo's opaque pixels, share of opaque pixels)."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            rgba = img.convert("RGBA")
+            rgba.thumbnail((96, 96))
+            px = [p for p in rgba.getdata() if p[3] > 60]
+            if not px:
+                return None
+            lum = sum((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 for r, g, b, _ in px) / len(px)
+            return lum, len(px) / (rgba.width * rgba.height)
+    except Exception:  # noqa: BLE001 - a bad logo file is just skipped
+        return None
+
+
+def _logo(slide, ctx: Ctx, x: float, y: float, max_w: float, max_h: float, *, align: str = "left") -> float | None:
+    """Brand logo from the media store; on a contrasting chip if it would vanish. Returns its width."""
+    lg = ctx.deck.theme.logo
+    path = resolve_media(lg.url) if lg is not None else None
+    if not path:
+        return None
+    from app.services.deck_render_kit import image_size
+
+    size = image_size(path)
+    stats = _logo_stats(path)
+    if not size or not stats:
+        return None
+    iw, ih = size
+    w = min(max_w, max_h * iw / ih)
+    h = w * ih / iw
+    if align == "center":
+        x = x + (max_w - w) / 2
+    t = ctx.look.t
+    r, g, b = (int(t.bg[i:i + 2], 16) for i in (1, 3, 5))
+    bg_light = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+    logo_l, opaque = stats
+    # A dark logo on a dark slide (or light on light) sits on a contrasting rounded chip;
+    # a logo that carries its own opaque background needs none.
+    if abs(logo_l - bg_light) < 0.3 and opaque < 0.92:
+        chip = "#FFFFFF" if logo_l < 0.5 else "#111111"
+        pad = 0.12
+        box(slide, x - pad, y - pad, w + 2 * pad, h + 2 * pad, chip, radius=0.1)
+    slide.shapes.add_picture(str(path), Inches(x), Inches(y), Inches(w), Inches(h))
+    return w
 
 
 def _footer(slide, ctx: Ctx) -> None:
@@ -388,11 +449,11 @@ def build_cover(slide, s: CoverSlide, ctx: Ctx) -> None:
                  size=size, color=mix(t.bg, t.accent, 0.12 if lk.dark else 0.1), bold=lk.head_bold,
                  italic=lk.italic, spacing=1.0, wrap=False)
     brand = (ctx.deck.brand or "").upper()[:60]
-    if brand:
+    if _logo(slide, ctx, MX, 0.6, 2.6, 0.8) is None and brand:
         box(slide, MX, 0.95, 0.55, 0.06, t.accent)
         text(slide, MX, 1.12, 8, 0.35, brand, font=lk.bf, size=14, color=t.accent if lk.dark else t.text,
              bold=True, tracking=3)
-    bottom = _headline(slide, ctx, s.title, MX, 1.7, 8.8, 3.3, max_pt=110, min_pt=40, anchor="bottom",
+    bottom = _headline(slide, ctx, s.title, MX, 1.75, 8.8, 3.25, max_pt=110, min_pt=40, anchor="bottom",
                        max_lines=3)
     bottom = _strip(slide, ctx, s.subtitle, MX, bottom + 0.25, 8.8, size=17)
     if s.tagline:
@@ -915,7 +976,7 @@ def build_fin(slide, s: FinSlide, ctx: Ctx) -> None:
         _body(slide, ctx, s.subtitle, (W - 9) / 2, y + f.height + 0.35, 9, 1.0, max_pt=20, min_pt=13,
               align="center", color=t.muted)
     brand = (ctx.deck.brand or "").upper()[:60]
-    if brand:
+    if _logo(slide, ctx, MX, H - 1.45, CONTENT_W, 0.6, align="center") is None and brand:
         text(slide, MX, H - 1.05, CONTENT_W, 0.3, brand, font=lk.bf, size=11, color=t.muted, bold=True,
              align="center", tracking=3)
 
@@ -972,7 +1033,8 @@ def render_deck(deck: Deck) -> bytes:
 
     for i, s in enumerate(deck.slides, start=1):
         slide = prs.slides.add_slide(blank)
-        ctx = Ctx(deck=deck, look=look, index=i, total=total, prev_hero=prev_hero)
+        ctx = Ctx(deck=deck, look=look, index=i, total=total, prev_hero=prev_hero,
+                  strong_decor=getattr(s, "layout", "") in ("cover", "divider", "fin"))
         builder = BUILDERS.get(getattr(s, "layout", ""), build_fallback)
         try:
             builder(slide, s, ctx)
