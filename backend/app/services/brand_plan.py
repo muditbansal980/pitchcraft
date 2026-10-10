@@ -1,7 +1,7 @@
 """Brand plan generation: research -> retrieval -> prompt -> Groq -> BrandPlanResponse.
 
 Token budget (Groq free tier for openai/gpt-oss-120b: 8,000 tokens/minute,
-prompt + completion incl. reasoning): the prompt is kept to ~3,800 tokens by
+prompt + completion incl. reasoning): the prompt is kept to ~4,200 tokens by
 fixed per-block character caps (see the _MAX_* constants) and the completion is
 capped at PLAN_MAX_TOKENS, so one request stays under 8K.
 """
@@ -9,6 +9,7 @@ capped at PLAN_MAX_TOKENS, so one request stays under 8K.
 import asyncio
 import logging
 import re
+from datetime import date
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -30,10 +31,10 @@ from app.services.retrieval import (
 logger = logging.getLogger(__name__)
 
 PLAN_MAX_TOKENS = 3500
-PROMPT_TOKEN_BUDGET = 3800
+PROMPT_TOKEN_BUDGET = 4200
 
 # Per-block character caps (~4 chars/token).
-_MAX_SUMMARY_CHARS = 1000
+_MAX_SUMMARY_CHARS = 850
 _SOURCES_PER_SECTION = 2
 _MAX_SOURCE_TITLE_CHARS = 90
 _MAX_SNIPPET_CHARS = 240
@@ -54,7 +55,7 @@ SYSTEM_PROMPT = """\
 You are the strategy team at WLDD, an Indian creator, meme and influencer marketing agency. \
 You are writing a proposal addressed to the marketing team of {brand}. It is the document \
 {brand} will receive, so write as WLDD ("we") speaking to {brand} ("you"). It is a forward-looking \
-plan for {brand}, not a summary of WLDD's history.
+plan for {brand}, not a summary of WLDD's history. Today's date is {today}.
 
 You are given three inputs:
 1. BRAND RESEARCH: recent web research on {brand}. It is your only source of facts about {brand}.
@@ -64,7 +65,7 @@ inspiration for tactics, formats and campaign mechanics. They are pitches, not c
 
 Write the plan in Markdown with exactly this structure:
 
-# {brand} × WLDD: <campaign name>
+# <campaign title>
 
 ## Where {brand} is today
 2-4 sentences on the brand's position, audience and recent marketing, grounded only in the research.
@@ -73,7 +74,7 @@ Write the plan in Markdown with exactly this structure:
 What {brand} should aim for in the next few months and why creator-led and meme-led marketing in \
 India is the right way to get there. End with one clear objective.
 
-## The big idea: <campaign name>
+## The big idea: <hook or hashtag>
 One campaign concept with a memorable hook or hashtag that fits Indian internet culture (Hinglish \
 is welcome where natural). Explain the idea in 3-5 sentences and give 2-3 example content ideas \
 that only make sense for {brand}.
@@ -97,6 +98,14 @@ search lift and so on). Do not invent target numbers about {brand}'s current per
 2-4 short bullets for what happens after {brand} says yes.
 
 Rules:
+- If BRAND RESEARCH shows a sale event, festival, launch or other big moment that is happening now \
+or within the next ~8 weeks (for example a festive sale), name it in "Where {brand} is today", build \
+the big idea around it and time the rollout phases to it. If it has just ended, ride its momentum \
+into the next moment. Never write a plan that ignores a moment happening right now.
+- The title names the campaign the way agency pitches do. Vary the style, for example \
+"{brand} x <idea or moment>", "<idea> – {brand}" or "{brand} <idea> <year>". Never title it \
+"{brand} × WLDD" or "{brand} x WLDD".
+- Spell {brand} exactly as given in titles and hashtags.
 - Use only facts about {brand} that appear in BRAND RESEARCH. Never invent statistics, follower \
 counts, revenue, market share, launches or quotes. If the research is thin, keep "Where {brand} is \
 today" short and general rather than guessing.
@@ -171,7 +180,7 @@ def build_messages(
         f"PAST PITCHES (internal inspiration only)\n{format_pitches(pitches)}\n\n"
         f"Write the plan for {brand}."
     )
-    return [SystemMessage(SYSTEM_PROMPT.format(brand=brand)), HumanMessage(user)]
+    return [SystemMessage(SYSTEM_PROMPT.format(brand=brand, today=date.today().strftime("%d %B %Y"))), HumanMessage(user)]
 
 
 def _clean_plan(content: str) -> str:

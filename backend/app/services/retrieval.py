@@ -70,10 +70,10 @@ def load_services_catalog() -> list[Service]:
 
 
 def build_pitch_queries(brand: str, research: list[ResearchSection]) -> list[str]:
-    """One short query per research angle (overview, marketing) prefixed with the brand."""
+    """One short query per research angle (overview, marketing, moments) prefixed with the brand."""
     by_title = {s.title.lower(): s for s in research}
     queries = []
-    for key in ("brand overview", "marketing & campaigns"):
+    for key in ("brand overview", "marketing & campaigns", "upcoming moments"):
         section = by_title.get(key)
         if section and section.summary and section.summary != "No summary found.":
             queries.append(clip_text(f"{brand}: {section.summary}", _MAX_QUERY_CHARS))

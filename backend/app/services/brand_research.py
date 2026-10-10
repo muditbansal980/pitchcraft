@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from tavily import AsyncTavilyClient
@@ -17,6 +18,7 @@ class ResearchQuery:
 
 
 def _queries(brand: str) -> list[ResearchQuery]:
+    month = date.today().strftime("%B %Y")
     return [
         ResearchQuery(
             "Brand overview",
@@ -27,6 +29,13 @@ def _queries(brand: str) -> list[ResearchQuery]:
             f"{brand} recent marketing campaigns, advertising, influencer and social media activity",
         ),
         ResearchQuery("Recent news", f"{brand} latest news", topic="news", time_range="month"),
+        # Tentpole moments (big sales, festive campaigns, launches) the plan should be built around.
+        ResearchQuery(
+            "Upcoming moments",
+            f"{brand} ongoing or upcoming sale event, festive campaign, product launch or big event {month}",
+            topic="news",
+            time_range="month",
+        ),
     ]
 
 
