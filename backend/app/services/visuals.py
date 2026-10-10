@@ -8,11 +8,57 @@ Fills every ``Visual`` request in a deck:
 - want="mock": AI image (``settings.image_gen_provider``).
 Results go through ``media.save_image``. Anything that fails stays a
 placeholder; this module never raises for a single bad visual.
+
+Fallbacks when a source is unavailable (verified 2026-10):
+- Imgflip captioning needs an account. Without one, popular templates whose
+  caption fits a top band are captioned locally (Pillow, "caption band" meme
+  format) from Imgflip's public template image.
+- Pollinations' anonymous endpoint now answers 402 (payment required). When no
+  image generator works, a non-hero mock falls back to a web reference image
+  for its brief (labelled ``kind="ref"`` with its source), the way the WLDD
+  idea slides use real reels as visual references. The hero stays empty and
+  the renderer draws a themed background instead.
+
+Process: every slot (hero first, then deck order) is fetched in parallel under a
+45 s overall cap; ref slots return a ranked candidate list, and a final pass in
+deck order assigns images so the same picture never appears twice in a deck.
 """
 
-from dataclasses import dataclass
+import asyncio
+import base64
+import io
+import logging
+import random
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
 
-from app.schemas.deck import Deck
+import httpx
+from PIL import Image, ImageChops, ImageDraw, ImageFont
+from pydantic import BaseModel
+from tavily import AsyncTavilyClient
+
+from app.core.config import settings
+from app.schemas.deck import Deck, Visual
+from app.services import llm_router, trends
+from app.services.media import image_digest, resolve_media, save_image
+from app.services.visuals_http import FetchedImage, fetch_image, new_client
+from app.services.visuals_safety import is_safe_text
+
+logger = logging.getLogger(__name__)
+
+OVERALL_TIMEOUT = 45.0
+SLOT_TIMEOUT = 30.0
+MAX_REF_CANDIDATES = 6
+MIN_REF_SIDE = 240
+TEMPLATE_TTL = 6 * 3600.0
+MOCK_FALLBACK_TO_REF = True
+
+MOCK_STYLE = "Instagram reel thumbnail, Indian context, photorealistic, no text, no logos, no watermark"
+HERO_STYLE = "wide 16:9 background photo, strong negative space, dark tones, no text, no logos, no watermark"
 
 
 @dataclass(frozen=True)
@@ -20,6 +66,7 @@ class MemeTemplate:
     id: str
     name: str
     box_count: int
+    url: str = ""  # blank template image (Imgflip CDN)
 
 
 @dataclass(frozen=True)
@@ -31,11 +78,623 @@ class VisualBudget:
     mock: int
 
 
+@dataclass
+class _Candidate:
+    data: bytes
+    mime: str
+    source_url: str
+    credit: str
+    kind: str
+    caption: str = ""
+
+    @property
+    def digest(self) -> str:
+        return image_digest(self.data)
+
+
+@dataclass
+class _Slot:
+    visual: Visual
+    want: str
+    is_hero: bool = False
+    candidates: list[_Candidate] = field(default_factory=list)
+
+
+# --- Imgflip templates ------------------------------------------------------
+
+_templates: tuple[float, list[MemeTemplate]] | None = None
+
+
 async def get_meme_templates() -> list[MemeTemplate]:
     """Imgflip's currently popular templates (cached ~6 h). Empty list on failure."""
-    return []
+    global _templates
+    if _templates and _templates[0] > time.monotonic():
+        return _templates[1]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.imgflip.com/get_memes")
+            resp.raise_for_status()
+            body = resp.json()
+        memes = (body.get("data") or {}).get("memes") or [] if body.get("success") else []
+        out = [
+            MemeTemplate(id=str(m["id"]), name=str(m["name"]), box_count=int(m.get("box_count") or 2),
+                         url=str(m.get("url") or ""))
+            for m in memes
+            if m.get("id") and m.get("name")
+        ]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Imgflip get_memes failed: %s", exc)
+        return _templates[1] if _templates else []
+    if out:
+        _templates = (time.monotonic() + TEMPLATE_TTL, out)
+    return out
+
+
+# --- helpers ----------------------------------------------------------------
+
+
+def _iter_visuals(node: Any):
+    """Every Visual inside a pydantic model tree (slides, cards, lists), in order."""
+    if isinstance(node, Visual):
+        yield node
+        return
+    if isinstance(node, BaseModel):
+        for name in type(node).model_fields:
+            yield from _iter_visuals(getattr(node, name, None))
+    elif isinstance(node, list | tuple):
+        for item in node:
+            yield from _iter_visuals(item)
+
+
+def _already_filled(v: Visual) -> bool:
+    return v.kind != "placeholder" and resolve_media(v.url) is not None
+
+
+def _domain(url: str) -> str:
+    host = urlparse(url).netloc.lower().split(":")[0]
+    for known in ("instagram.com", "reddit.com", "redd.it", "facebook.com", "fbcdn.net", "twitter.com", "x.com",
+                  "youtube.com", "ytimg.com", "pinterest.com", "pinimg.com"):
+        if host == known or host.endswith("." + known):
+            return {"redd.it": "reddit.com", "fbcdn.net": "facebook.com", "ytimg.com": "youtube.com",
+                    "pinimg.com": "pinterest.com"}.get(known, known)
+    return host.removeprefix("www.").removeprefix("m.")
+
+
+def _usable(data: bytes, min_side: int = MIN_REF_SIDE) -> bool:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            w, h = img.size
+            if min(w, h) < min_side or not 0.4 <= w / h <= 2.6:
+                return False
+            # Reject almost-blank images (blank placeholders, white boxes).
+            small = img.convert("L").resize((32, 32))
+            lo, hi = small.getextrema()
+            return hi - lo > 40
+    except Exception:
+        return False
+
+
+def trim_borders(data: bytes) -> bytes:
+    """Crop uniform letterbox/pillarbox bars (video thumbnails, padded screenshots)."""
+    try:
+        with Image.open(io.BytesIO(data)) as src:
+            img = src.convert("RGB")
+    except Exception:
+        return data
+    w, h = img.size
+    corner = img.getpixel((0, 0))
+    bg = Image.new("RGB", img.size, corner)
+    diff = ImageChops.difference(img, bg).convert("L").point(lambda p: 255 if p > 28 else 0)
+    bbox = diff.getbbox()
+    if not bbox:
+        return data
+    bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    trimmed = (w - bw) / w + (h - bh) / h
+    if trimmed < 0.04 or bw * bh < 0.45 * w * h:
+        return data
+    out = io.BytesIO()
+    img.crop(bbox).save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+
+def _thumb_for_vision(data: bytes) -> tuple[bytes, str]:
+    with Image.open(io.BytesIO(data)) as img:
+        img = img.convert("RGB")
+        img.thumbnail((512, 512))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=80)
+        return buf.getvalue(), "image/jpeg"
+
+
+_STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "with", "meme", "memes", "reel",
+         "post", "instagram", "viral", "india", "indian", "trend", "trending", "image", "photo"}
+
+
+def _keywords(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]{3,}", text.lower()) if w not in _STOP}
+
+
+# --- ref candidates ---------------------------------------------------------
+
+
+@dataclass
+class _Ctx:
+    client: httpx.AsyncClient
+    tavily: AsyncTavilyClient | None
+    pulse: list[trends.TrendPost]
+    templates: dict[str, MemeTemplate]
+    theme_name: str
+    sem_download: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(10))
+    sem_search: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
+    sem_gen: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(3))
+    mock_dead: set[str] = field(default_factory=set)
+    logged: set[str] = field(default_factory=set)
+
+    def log_once(self, key: str, msg: str, *args: Any) -> None:
+        if key not in self.logged:
+            self.logged.add(key)
+            logger.info(msg, *args)
+
+
+async def _tavily_images(ctx: _Ctx, query: str) -> list[tuple[str, str, str]]:
+    """(image_url, description, source) for a query, in Tavily rank order."""
+    if not ctx.tavily:
+        ctx.log_once("tavily", "visuals: TAVILY_API_KEY missing; no web reference images")
+        return []
+    params: dict[str, Any] = {"include_images": True, "include_image_descriptions": True, "max_results": 5}
+    if settings.research_country:
+        params["country"] = settings.research_country
+    async with ctx.sem_search:
+        try:
+            result = await asyncio.wait_for(ctx.tavily.search(query, **params), timeout=15)
+        except Exception as exc:
+            try:  # some Tavily versions reject "country" for this topic
+                params.pop("country", None)
+                result = await asyncio.wait_for(ctx.tavily.search(query, **params), timeout=15)
+            except Exception:
+                logger.info("visuals: Tavily image search failed for %r: %s", query, exc)
+                return []
+    out = []
+    for item in result.get("images") or []:
+        if isinstance(item, str):
+            out.append((item, "", _domain(item)))
+        elif isinstance(item, dict) and item.get("url"):
+            desc = item.get("description") or item.get("title") or ""
+            out.append((item["url"], str(desc), _domain(item["url"])))
+    return out
+
+
+async def _reddit_images(ctx: _Ctx, query: str) -> list[tuple[str, str, str]]:
+    posts = await trends.search_reddit_images(query, limit=4)
+    out = []
+    for p in posts:
+        if p.image_url and is_safe_text(p.title):
+            out.append((p.image_url, p.title, p.permalink or f"reddit.com/r/{p.subreddit}"))
+    return out
+
+
+def _pulse_matches(ctx: _Ctx, query: str) -> list[tuple[str, str, str]]:
+    """This week's top posts sharing at least two keywords with the query (cheap relevance gate)."""
+    kws = _keywords(query)
+    out = []
+    for p in ctx.pulse:
+        if p.image_url and len(kws & _keywords(p.title)) >= 2 and is_safe_text(p.title):
+            out.append((p.image_url, p.title, p.permalink or f"reddit.com/r/{p.subreddit}"))
+    return out[:2]
+
+
+def _interleave(*lists: list) -> list:
+    out = []
+    for i in range(max((len(x) for x in lists), default=0)):
+        for x in lists:
+            if i < len(x):
+                out.append(x[i])
+    return out
+
+
+def _relevance(brief: str, desc: str) -> int:
+    return len(_keywords(brief) & _keywords(desc))
+
+
+async def _download(ctx: _Ctx, url: str) -> FetchedImage | None:
+    async with ctx.sem_download:
+        return await fetch_image(ctx.client, url)
+
+
+async def _ref_candidates(ctx: _Ctx, v: Visual, kind: str = "ref") -> list[_Candidate]:
+    query = (v.query or v.brief or "").strip()
+    if not query:
+        return []
+    tav, red = await asyncio.gather(_tavily_images(ctx, query), _reddit_images(ctx, query))
+    # Without a vision model the order is the choice: search hits whose description shares the
+    # most words with the brief first (stable, so source rank breaks ties), pulse posts last.
+    brief = f"{v.brief} {v.query or ''}"
+    searched = sorted(_interleave(tav, red), key=lambda c: -_relevance(brief, c[1]))
+    pool, seen = [], set()
+    for url, desc, src in [*searched, *_pulse_matches(ctx, query)]:
+        if url not in seen and is_safe_text(desc):
+            seen.add(url)
+            pool.append((url, desc, src))
+    pool = pool[: MAX_REF_CANDIDATES + 2]  # a couple spare for failed downloads
+    fetched = await asyncio.gather(*(_download(ctx, url) for url, _, _ in pool))
+
+    cands: list[_Candidate] = []
+    digests: set[str] = set()
+    for (url, desc, src), img in zip(pool, fetched, strict=True):
+        if not img:
+            continue
+        img = FetchedImage(trim_borders(img.data), img.mime, img.url, img.page_url)
+        if not _usable(img.data):
+            continue
+        page = src if src.startswith("http") else (img.page_url or url)
+        c = _Candidate(
+            data=img.data, mime=img.mime, kind=kind, caption=desc[:200],
+            source_url=page, credit=f"Ref: {_domain(page)}"[:120],
+        )
+        if c.digest not in digests:
+            digests.add(c.digest)
+            cands.append(c)
+        if len(cands) >= MAX_REF_CANDIDATES:
+            break
+    return await _rank_with_vision(v, cands)
+
+
+async def _rank_with_vision(v: Visual, cands: list[_Candidate]) -> list[_Candidate]:
+    if len(cands) < 2:
+        return cands
+    prompt = (
+        "You pick reference images for an Indian social-media agency pitch deck slide.\n"
+        f"Slot brief: {v.brief or v.query}\n"
+        f"Search query: {v.query or v.brief}\n"
+        f"There are {len(cands)} images, numbered 0 to {len(cands) - 1} in the order given.\n"
+        "Score each for relevance to the brief, legibility at slide size and brand safety "
+        "(no nudity, gore, hate, slurs, political or religious provocation, competitor logos as the focus).\n"
+        'Reply as JSON: {"ranking": [best index first, only usable ones], "reject": [unsafe or irrelevant indexes]}'
+    )
+    try:
+        images = [_thumb_for_vision(c.data) for c in cands]
+        answer = await asyncio.wait_for(llm_router.invoke_vision_json(prompt, images), timeout=20)
+    except Exception as exc:  # vision is optional: fall back to source rank
+        logger.info("visuals: vision ranking unavailable (%s); using source rank", exc.__class__.__name__)
+        return cands
+    if not isinstance(answer, dict):
+        return cands
+    reject = {i for i in answer.get("reject") or [] if isinstance(i, int)}
+    ranking = [i for i in answer.get("ranking") or [] if isinstance(i, int) and 0 <= i < len(cands)]
+    ordered = [cands[i] for i in dict.fromkeys(ranking) if i not in reject]
+    if not ordered:
+        ordered = [c for i, c in enumerate(cands) if i not in reject]
+    return ordered
+
+
+# --- memes ------------------------------------------------------------------
+
+
+async def _imgflip_caption(ctx: _Ctx, template_id: str, boxes: list[str]) -> _Candidate | None:
+    form: dict[str, str] = {
+        "template_id": template_id,
+        "username": settings.imgflip_username or "",
+        "password": settings.imgflip_password or "",
+    }
+    for i, text in enumerate(boxes):
+        form[f"boxes[{i}][text]"] = text
+    try:
+        resp = await ctx.client.post("https://api.imgflip.com/caption_image", data=form)
+        body = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.info("visuals: Imgflip caption_image failed: %s", exc)
+        return None
+    if not body.get("success"):
+        logger.info("visuals: Imgflip refused caption: %s", body.get("error_message"))
+        return None
+    data = body.get("data") or {}
+    img = await _download(ctx, data.get("url", ""))
+    if not img:
+        return None
+    name = ctx.templates.get(template_id)
+    return _Candidate(data=img.data, mime=img.mime, kind="meme",
+                      source_url=data.get("page_url") or data.get("url", ""),
+                      credit=f"Brand meme, Imgflip template: {name.name if name else template_id}"[:120])
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ):
+        if Path(path).is_file():
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default(size=size)
+
+
+def _wrap(draw: ImageDraw.ImageDraw, text: str, font, width: int) -> list[str]:
+    lines: list[str] = []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split():
+            trial = f"{line} {word}".strip()
+            if draw.textlength(trial, font=font) <= width or not line:
+                line = trial
+            else:
+                lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+    return lines
+
+
+# Templates whose captions belong inside panels: box rectangles as fractions (x0, y0, x1, y1).
+PANEL_LAYOUTS: dict[str, list[tuple[float, float, float, float]]] = {
+    "181913649": [(0.52, 0.03, 0.97, 0.47), (0.52, 0.53, 0.97, 0.97)],  # Drake Hotline Bling
+}
+
+
+def panel_meme(template: bytes, boxes: list[str], layout: list[tuple[float, float, float, float]]) -> bytes:
+    """Write each caption centred inside its panel (black on the template's white panels)."""
+    with Image.open(io.BytesIO(template)) as src:
+        img = src.convert("RGB")
+    img.thumbnail((1000, 1000))
+    draw = ImageDraw.Draw(img)
+    for caption, (fx0, fy0, fx1, fy1) in zip(boxes, layout, strict=False):
+        x0, y0, x1, y1 = fx0 * img.width, fy0 * img.height, fx1 * img.width, fy1 * img.height
+        bw, bh = x1 - x0, y1 - y0
+        size = int(bh / 4)
+        while True:
+            font = _font(size)
+            lines = _wrap(draw, caption.strip(), font, int(bw))
+            if (len(lines) * size * 1.2 <= bh and all(draw.textlength(ln, font=font) <= bw for ln in lines)) \
+                    or size <= 14:
+                break
+            size -= 2
+        y = y0 + (bh - len(lines) * size * 1.2) / 2
+        for line in lines:
+            lw = draw.textlength(line, font=font)
+            draw.text((x0 + (bw - lw) / 2, y), line, font=font, fill=(0, 0, 0))
+            y += size * 1.2
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def caption_band_meme(template: bytes, boxes: list[str]) -> bytes:
+    """Classic "caption above the picture" meme: white band with bold black text over the template."""
+    with Image.open(io.BytesIO(template)) as src:
+        img = src.convert("RGB")
+    img.thumbnail((900, 900))
+    w = img.width
+    pad = max(18, w // 28)
+    text = "\n".join(b.strip() for b in boxes if b.strip())
+    probe = ImageDraw.Draw(img)
+    size = max(22, w // 16)
+    while True:
+        font = _font(size)
+        lines = _wrap(probe, text, font, w - 2 * pad)
+        if len(lines) <= 5 or size <= 18:
+            break
+        size -= 2
+    line_h = int(size * 1.25)
+    band = pad * 2 + line_h * len(lines)
+    out = Image.new("RGB", (w, img.height + band), "white")
+    out.paste(img, (0, band))
+    draw = ImageDraw.Draw(out)
+    y = pad
+    for line in lines:
+        draw.text((pad, y), line, font=font, fill=(0, 0, 0))
+        y += line_h
+    buf = io.BytesIO()
+    out.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+async def _meme(ctx: _Ctx, v: Visual) -> _Candidate | None:
+    boxes = [b for b in v.meme_boxes if b and b.strip()]
+    tid = (v.meme_template_id or "").strip()
+    if not tid or not boxes:
+        return None
+    if not is_safe_text(*boxes):
+        logger.info("visuals: meme caption failed the safety filter; left as placeholder")
+        return None
+    if settings.imgflip_username and settings.imgflip_password:
+        made = await _imgflip_caption(ctx, tid, boxes)
+        if made:
+            return made
+    else:
+        ctx.log_once("imgflip", "visuals: Imgflip credentials missing; captioning templates locally")
+    tpl = ctx.templates.get(tid)
+    if not tpl or not tpl.url:
+        return None
+    img = await _download(ctx, tpl.url)
+    if not img:
+        return None
+    try:
+        layout = PANEL_LAYOUTS.get(tid)
+        if layout and len(boxes) <= len(layout):
+            data = await asyncio.to_thread(panel_meme, img.data, boxes, layout)
+        else:
+            data = await asyncio.to_thread(caption_band_meme, img.data, boxes)
+    except Exception as exc:
+        logger.info("visuals: local meme caption failed: %s", exc)
+        return None
+    return _Candidate(data=data, mime="image/jpeg", kind="meme", source_url=tpl.url,
+                      credit=f"Brand meme, template: {tpl.name}"[:120])
+
+
+# --- AI mocks ---------------------------------------------------------------
+
+
+def _mock_prompt(ctx: _Ctx, v: Visual, hero: bool) -> str:
+    base = " ".join((v.brief or v.query or "").split())[:260]
+    return f"{base}. {HERO_STYLE if hero else MOCK_STYLE}"
+
+
+async def _pollinations(ctx: _Ctx, prompt: str, hero: bool) -> bytes | None:
+    key = getattr(settings, "pollinations_api_key", None)
+    seed = random.randint(1, 2**31 - 1)
+    params = f"width=1280&height=720&nologo=true&seed={seed}" if hero else f"width=1024&height=1024&nologo=true&seed={seed}"
+    if key:  # new authenticated endpoint (untested here: no key)
+        url = f"https://gen.pollinations.ai/image/{quote(prompt, safe='')}?{params}&model=flux"
+        headers = {"Authorization": f"Bearer {key}"}
+    else:
+        url = f"https://image.pollinations.ai/prompt/{quote(prompt, safe='')}?{params}"
+        headers = {}
+    try:
+        resp = await ctx.client.get(url, headers=headers, timeout=httpx.Timeout(60.0, connect=8.0))
+    except httpx.HTTPError as exc:
+        logger.info("visuals: Pollinations request failed: %s", exc)
+        return None
+    if resp.status_code in (401, 402, 403):
+        ctx.mock_dead.add("pollinations")
+        ctx.log_once("pollinations", "visuals: Pollinations answered %s (key/payment required); no AI mocks",
+                     resp.status_code)
+        return None
+    if resp.status_code != 200 or not resp.headers.get("content-type", "").startswith("image/"):
+        logger.info("visuals: Pollinations returned %s", resp.status_code)
+        return None
+    return resp.content
+
+
+async def _cloudflare(ctx: _Ctx, prompt: str) -> bytes | None:
+    acct, token = settings.cloudflare_account_id, settings.cloudflare_api_token
+    if not acct or not token:
+        ctx.mock_dead.add("cloudflare")
+        ctx.log_once("cloudflare", "visuals: Cloudflare Workers AI keys missing; no AI mocks")
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    try:
+        resp = await ctx.client.post(url, json={"prompt": prompt, "steps": 4},
+                                     headers={"Authorization": f"Bearer {token}"},
+                                     timeout=httpx.Timeout(60.0, connect=8.0))
+        body = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.info("visuals: Cloudflare image generation failed: %s", exc)
+        return None
+    if resp.status_code in (401, 403):
+        ctx.mock_dead.add("cloudflare")
+        ctx.log_once("cloudflare-auth", "visuals: Cloudflare rejected the token (%s)", resp.status_code)
+        return None
+    image = (body.get("result") or {}).get("image") if isinstance(body, dict) else None
+    if not image:
+        logger.info("visuals: Cloudflare returned no image: %s", str(body)[:200])
+        return None
+    try:
+        return base64.b64decode(image)
+    except ValueError:
+        return None
+
+
+async def _mock(ctx: _Ctx, v: Visual, hero: bool) -> list[_Candidate]:
+    provider = settings.image_gen_provider
+    prompt = _mock_prompt(ctx, v, hero)
+    data = None
+    if provider != "none" and provider not in ctx.mock_dead and is_safe_text(prompt):
+        async with ctx.sem_gen:
+            if provider not in ctx.mock_dead:
+                data = await (_pollinations(ctx, prompt, hero) if provider == "pollinations"
+                              else _cloudflare(ctx, prompt))
+    if data and _usable(data, min_side=256):
+        label = "FLUX schnell" if provider == "cloudflare" else "Pollinations"
+        return [_Candidate(data=data, mime="image/jpeg", kind="mock", source_url="",
+                           credit=f"AI mock ({label})", caption=v.brief[:200])]
+    if hero or not MOCK_FALLBACK_TO_REF:
+        return []
+    return await _ref_candidates(ctx, v, kind="ref")
+
+
+# --- orchestration ----------------------------------------------------------
+
+
+async def _fill(ctx: _Ctx, slot: _Slot) -> None:
+    try:
+        if slot.want == "ref":
+            slot.candidates = await _ref_candidates(ctx, slot.visual)
+        elif slot.want == "meme":
+            made = await _meme(ctx, slot.visual)
+            slot.candidates = [made] if made else []
+        else:
+            slot.candidates = await _mock(ctx, slot.visual, slot.is_hero)
+    except Exception:  # one bad visual must never break the deck
+        logger.exception("visuals: slot failed (%s: %s)", slot.want, slot.visual.brief[:60])
+        slot.candidates = []
+
+
+def _select_slots(deck: Deck, budget: VisualBudget) -> list[_Slot]:
+    left = {"ref": max(0, budget.ref), "meme": max(0, budget.meme), "mock": max(0, budget.mock)}
+    slots: list[_Slot] = []
+    hero = deck.theme.hero_image
+    if hero is not None and not _already_filled(hero) and (hero.brief or hero.query):
+        slots.append(_Slot(visual=hero, want="mock", is_hero=True))  # one per deck, outside the budget
+    seen: set[int] = set()
+    for slide in deck.slides:
+        for v in _iter_visuals(slide):
+            if id(v) in seen or _already_filled(v):
+                continue
+            seen.add(id(v))
+            want = v.want if v.want in left else "mock"
+            if left[want] > 0 and (v.brief or v.query or v.meme_boxes):
+                left[want] -= 1
+                slots.append(_Slot(visual=v, want=want))
+    return slots
 
 
 async def attach_visuals(deck: Deck, budget: VisualBudget) -> Deck:
     """Fill the deck's visual requests (incl. ``deck.theme.hero_image``) within ``budget``."""
+    deck = deck.model_copy(deep=True)
+    slots = _select_slots(deck, budget)
+    if not slots:
+        return deck
+    started = time.monotonic()
+
+    async with new_client(timeout=10) as client:
+        templates: dict[str, MemeTemplate] = {}
+        pulse: list[trends.TrendPost] = []
+        if any(s.want == "meme" for s in slots):
+            templates = {t.id: t for t in await get_meme_templates()}
+        if any(s.want in ("ref", "mock") for s in slots):
+            try:
+                pulse = (await asyncio.wait_for(trends.get_trend_pulse(), timeout=12)).posts
+            except Exception:
+                pulse = []
+        ctx = _Ctx(
+            client=client,
+            tavily=AsyncTavilyClient(api_key=settings.tavily_api_key) if settings.tavily_api_key else None,
+            pulse=pulse, templates=templates, theme_name=deck.theme.name,
+        )
+        tasks = [asyncio.create_task(asyncio.wait_for(_fill(ctx, s), SLOT_TIMEOUT)) for s in slots]
+        remaining = max(5.0, OVERALL_TIMEOUT - (time.monotonic() - started))
+        done, pending = await asyncio.wait(tasks, timeout=remaining)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            if not t.cancelled() and t.exception():  # slot-level timeouts
+                logger.info("visuals: slot timed out or failed: %s", t.exception().__class__.__name__)
+
+    # Assign in deck order so the same image is never used twice.
+    used: set[str] = set()
+    filled = {"ref": 0, "meme": 0, "mock": 0}
+    for slot in slots:
+        for cand in slot.candidates:
+            if cand.digest in used:
+                continue
+            try:
+                url = save_image(cand.data)
+            except ValueError:
+                continue
+            used.add(cand.digest)
+            v = slot.visual
+            v.kind = cand.kind  # type: ignore[assignment]
+            v.url = url
+            v.source_url = cand.source_url or None
+            v.credit = cand.credit or None
+            filled[cand.kind if cand.kind in filled else "mock"] += 1
+            break
+    logger.info(
+        "visuals: %d slots, filled ref=%d meme=%d mock=%d, %d left as placeholders, %.1fs",
+        len(slots), filled["ref"], filled["meme"], filled["mock"],
+        sum(1 for s in slots if s.visual.kind == "placeholder"), time.monotonic() - started,
+    )
     return deck

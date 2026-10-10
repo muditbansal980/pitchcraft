@@ -153,6 +153,9 @@ Response adds `scale` (resolved), `brief`, `deck: Deck` (`plan` Markdown is now 
 - `visuals.get_meme_templates() -> [MemeTemplate{id, name, box_count}]`, `visuals.attach_visuals(deck, VisualBudget{ref, meme, mock}) -> Deck`
 - `themes.THEME_DESCRIPTIONS`, `themes.ThemeChoice{name, accent_hint, hero_prompt}`, `themes.probe_brand_colors(brand) -> [hex]`, `themes.resolve_theme(choice, brand_colors) -> Theme`
 - `deck_render.render_deck(deck) -> bytes` (sync), `PPTX_MIME`
+- `MemeTemplate` also has optional `url` (blank template image, used for local captioning when no Imgflip account).
+- The theme hero image is attempted outside `VisualBudget` (one per deck).
+- `Theme.accent_2` is a fill colour only (always black/white text on it), so it is not contrast-checked against `bg`.
 - Stubs return safe empty defaults (except `render_deck`, `save_image`, `resolve_media`, `invoke_*`) so agents can build in parallel.
 
 ## v2 agent assignments (exclusive file ownership, no commits by agents)
@@ -169,7 +172,7 @@ Need a contract change? Report it to the coordinator instead of editing a file y
 ## v2 progress log
 - [x] Step 0 — branch, contracts (C3–C7), stubs, settings, deps (`python-pptx`, `pillow`, `cryptography`, `langchain-google-genai`, `httpx`), `/media` mount
 - [ ] Agent A — generation pipeline
-- [ ] Agent B — visuals, themes, PPTX
+- [x] Agent B — visuals, themes, PPTX. **Accepted** (coordinator reviewed rendered sheets for the fixture deck and A's Audible deck; re-rendered fixture 16 slides in 0.17 s, empty deck OK). Live: Tavily images (Instagram reels via og:image), brand colour probe, Imgflip templates (local captioning). Not working without keys: Pollinations (402 anonymous, watermark), Reddit (RSS fallback, 429s), Cloudflare/Imgflip captioning/Reddit OAuth untested. Vision picking falls back to description match until Gemini is set.
 - [x] Agent C — Canva + frontend. **Accepted** (coordinator re-ran: eslint clean, `tsc --noEmit` clean, 12/12 Canva service mock checks, route TestClient checks). Notes: stateless Fernet-encrypted OAuth state; single-use refresh tokens serialised per user; Node fetch has a hard 300 s headers timeout so >290 s requests use `node:http`; callback uses a relative redirect to keep the 127.0.0.1 cookie. Unverified: real Canva OAuth/import (no keys), browser click-through.
 - [ ] Integration test
 - [ ] PR

@@ -59,6 +59,8 @@ class Settings(BaseSettings):
 
     # AI mock visuals: "cloudflare" (Workers AI FLUX schnell), "pollinations" (no key) or "none".
     image_gen_provider: Literal["cloudflare", "pollinations", "none"] = "pollinations"
+    # Anonymous Pollinations now returns 402 after ~1 image; a key (gen.pollinations.ai) lifts that.
+    pollinations_api_key: str | None = None
     cloudflare_account_id: str | None = None
     cloudflare_api_token: str | None = None
 
