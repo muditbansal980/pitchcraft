@@ -25,5 +25,13 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-120b"
     groq_reasoning_effort: str = "low"
 
+    # Generate with: python -c "import secrets; print(secrets.token_urlsafe(64))"
+    jwt_secret_key: str | None = None
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 180
+    auth_cookie_name: str = "access_token"
+    # Set to true in production (HTTPS only).
+    auth_cookie_secure: bool = False
+
 
 settings = Settings()

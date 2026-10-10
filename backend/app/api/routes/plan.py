@@ -4,6 +4,7 @@ import groq
 from fastapi import APIRouter, HTTPException, status
 from tavily import InvalidAPIKeyError, UsageLimitExceededError
 
+from app.api.deps import CurrentUser
 from app.core.config import settings
 from app.schemas.plan import BrandPlanRequest, BrandPlanResponse
 from app.services.brand_plan import PlanGenerationError, ServicesCatalogEmptyError, generate_brand_plan
@@ -14,7 +15,7 @@ router = APIRouter(prefix="/api", tags=["plan"])
 
 
 @router.post("/brand-plan", response_model=BrandPlanResponse)
-async def brand_plan(payload: BrandPlanRequest) -> BrandPlanResponse:
+async def brand_plan(payload: BrandPlanRequest, _user: CurrentUser) -> BrandPlanResponse:
     brand = payload.brand.strip()
     if not brand:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Brand name is required")
