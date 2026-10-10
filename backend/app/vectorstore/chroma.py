@@ -22,3 +22,7 @@ def get_vector_store() -> Chroma:
 
 def get_services_store() -> Chroma:
     return _store(settings.chroma_services_collection)
+
+
+def get_pitches_store() -> Chroma:
+    return _store(settings.chroma_collection)
