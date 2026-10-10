@@ -2,6 +2,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
+import { deleteUploadedReport } from "@/lib/report-files";
 import type { BrandPlan } from "@/lib/types";
 
 // Saved in this browser only, until the backend can store researches per user.
@@ -49,12 +50,21 @@ export function saveResearch(plan: BrandPlan): SavedResearch {
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   };
-  write([item, ...parse(readRaw())]);
+  const items = [item, ...parse(readRaw())];
+  // Researches past the cap are dropped, so drop their stored PDFs too.
+  for (const old of items.slice(MAX_SAVED)) {
+    if (old.pdfPublicId) deleteUploadedReport(old.pdfPublicId);
+  }
+  write(items);
   return item;
 }
 
-export function updateResearch(id: string, patch: Partial<Omit<SavedResearch, "id">>) {
-  write(parse(readRaw()).map((item) => (item.id === id ? { ...item, ...patch } : item)));
+/** Returns false if the research no longer exists (e.g. it was deleted meanwhile). */
+export function updateResearch(id: string, patch: Partial<Omit<SavedResearch, "id">>): boolean {
+  const items = parse(readRaw());
+  if (!items.some((item) => item.id === id)) return false;
+  write(items.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  return true;
 }
 
 export function deleteResearch(id: string) {

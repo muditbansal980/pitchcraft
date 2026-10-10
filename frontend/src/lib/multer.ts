@@ -18,8 +18,13 @@ export async function readSingleFile(
 ): Promise<Express.Multer.File | undefined> {
   if (!request.body) return undefined;
 
+  const headers = Object.fromEntries(request.headers);
+  // Multer skips bodies with neither header (type-is `hasBody`), and Next can strip
+  // `transfer-encoding` when proxying, so mark a length-less body as chunked.
+  if (!headers["content-length"]) headers["transfer-encoding"] ??= "chunked";
+
   const req = Object.assign(Readable.fromWeb(request.body as NodeReadableStream), {
-    headers: Object.fromEntries(request.headers),
+    headers,
     method: request.method,
     url: request.url,
   });
