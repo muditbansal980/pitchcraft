@@ -12,3 +12,4 @@ wheels/
 # Local env and database
 .env
 *.db
+chroma_data/

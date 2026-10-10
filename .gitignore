@@ -31,6 +31,7 @@ dist/
 htmlcov/
 *.db
 *.sqlite3
+chroma_data/
 
 # ---------- Frontend (Next.js) ----------
 node_modules/

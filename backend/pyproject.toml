@@ -2,10 +2,14 @@
 name = "pitchcraft-backend"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.0",
+    "chromadb>=1.5.9",
     "fastapi[standard]>=0.143.0",
+    "langchain>=1.4.4",
+    "langchain-chroma>=1.1.0",
     "pydantic-settings>=2.15.0",
+    "pymupdf>=1.28.2",
     "sqlalchemy>=2.0.54",
 ]
