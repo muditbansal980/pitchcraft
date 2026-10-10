@@ -64,9 +64,13 @@ from app.schemas.deck import (
     Visual,
 )
 from app.schemas.plan import BrandPlanResponse, PastPitchRef
-from app.services import llm_router, themes, trends, visuals
+from app.services import brand_identity, llm_router, memes, themes, trends, visuals
+from app.services.brand_identity import BrandIdentity
+from app.services.brand_identity_season import SEASONS, detect_season_detail
 from app.services.brand_research import research_brand
 from app.services.plan_checks import (
+    BANNED_PLATFORM_RE,
+    NARRATIVE_LAYOUTS,
     PRICE_RE,
     PROPOSAL_KEYS,
     banned_terms,
@@ -117,7 +121,8 @@ SLIDE_ADAPTER: TypeAdapter = TypeAdapter(Slide)
 _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 # Strategist completion budgets (auto uses the flagship one: the scale is not known yet).
-_STRATEGIST_TOKENS = {"focused": 2400, "standard": 3000, "flagship": 3300}
+# Real strategist outputs peaked at ~1.8K tokens (flagship); the rest is headroom for reasoning.
+_STRATEGIST_TOKENS = {"focused": 2200, "standard": 2800, "flagship": 3000}
 # Above this prompt capacity the strategist gets full past-deck text ("rich" context).
 _RICH_CAPACITY = 40_000
 # Writer prompt size we plan for when splitting the deck into groups.
@@ -150,7 +155,8 @@ class Inputs:
     research: list[ResearchSection] = field(default_factory=list)
     pitches: list[PitchMatch] = field(default_factory=list)
     trend: trends.TrendPulse = field(default_factory=trends.TrendPulse)
-    memes: list[visuals.MemeTemplate] = field(default_factory=list)
+    memes: list[visuals.MemeTemplate] = field(default_factory=list)  # shortlist(s): the only allowed templates
+    identity: BrandIdentity | None = None
     colors: list[str] = field(default_factory=list)
     full_texts: dict[str, str] = field(default_factory=dict)
     shown_texts: list[str] = field(default_factory=list)
@@ -200,16 +206,31 @@ async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inp
         scale = stated
     inputs = Inputs(brand=brand, brief=brief, requested_scale=scale, today=date.today().strftime("%d %B %Y"), services=services)
 
-    research, pulse, memes, colors = await asyncio.gather(
+    # The identity probe mostly reads the brand's website, so it runs alongside research with no
+    # research text; motifs and the season are re-derived from the research afterwards.
+    research, pulse, shortlist, ident = await asyncio.gather(
         research_brand(brand),
         _safe(trends.get_trend_pulse(), trends.TrendPulse(), "Trend pulse"),
-        _safe(visuals.get_meme_templates(), [], "Meme templates"),
-        _safe(themes.probe_brand_colors(brand), [], "Brand colour probe"),
+        _safe(memes.meme_shortlist(brand, [brand, brief or ""], n=12), [], "Meme shortlist"),
+        _safe(brand_identity.probe_brand_identity(brand, ""), None, "Brand identity"),
     )
     inputs.research = research.sections
     inputs.trend = pulse or trends.TrendPulse()
-    inputs.memes = [m for m in (memes or []) if m.box_count >= 1]
-    inputs.colors = [c for c in (colors or []) if isinstance(c, str) and _HEX_RE.match(c)]
+    inputs.memes = [m for m in (shortlist or []) if m.box_count >= 1]
+    ident = ident or BrandIdentity(brand=brand)
+    research_text = inputs.research_text
+    try:
+        from_research = brand_identity.extract_motifs(
+            brand, ident.site_nav, ident.site_headings + [ident.title], ident.description, research_text, limit=10,
+        )
+    except Exception as exc:  # noqa: BLE001 - motifs are optional
+        logger.info("Motif extraction failed (%s); keeping the site motifs", exc)
+        from_research = []
+    ident.motifs = _merge_motifs(ident.motifs, from_research)
+    # The brief comes first so a moment it names wins ties against the research.
+    ident.season, ident.season_source = detect_season_detail(date.today(), f"{brief or ''}\n{research_text}")
+    inputs.identity = ident
+    inputs.colors = [c for c in ident.colors if isinstance(c, str) and _HEX_RE.match(c)]
     inputs.timings["research"] = time.monotonic() - started
 
     t = time.monotonic()
@@ -220,11 +241,37 @@ async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inp
         inputs.full_texts = {p.pitch_id: text for p, text in zip(inputs.pitches, texts) if text}
     inputs.timings["retrieval"] = time.monotonic() - t
     logger.info(
-        "Plan inputs for %r: %d research sections, %d pitches %s, %d trend posts, %d meme templates, colours %s",
+        "Plan inputs for %r: %d research sections, %d pitches %s, %d trend posts, meme shortlist %s, identity site=%s "
+        "colours=%s fonts=%s/%s logo=%s motifs=%s season=%s (%s)",
         brand, len(inputs.research), len(inputs.pitches), [p.pitch_id for p in inputs.pitches],
-        len(inputs.trend.posts), len(inputs.memes), inputs.colors,
+        len(inputs.trend.posts), [m.id for m in inputs.memes], ident.site_url, inputs.colors, ident.heading_font,
+        ident.body_font, bool(ident.logo_url), ident.motifs, ident.season, ident.season_source,
     )
     return inputs
+
+
+# Words research text is full of that are not products or objects of the brand.
+_GENERIC_MOTIFS = {
+    "marketing", "people", "brand", "brands", "company", "customers", "customer", "users", "user", "india",
+    "indian", "campaign", "campaigns", "social media", "market", "business", "platform", "services", "service",
+    "news", "year", "years", "time", "growth", "revenue", "share", "app users", "consumers", "audience",
+    "content", "online", "digital", "influencer", "influencers", "ceo", "founder", "report", "latest",
+    "their", "positioning", "strategy", "also", "more", "other", "new", "top", "best", "first", "data",
+    "launch", "position", "leader", "leading", "category", "sector", "industry", "segment", "offering",
+}
+
+
+def _merge_motifs(site: list[str], research: list[str], limit: int = 6) -> list[str]:
+    """Site motifs first (the brand's own words), then research ones that look like products/objects."""
+    out: list[str] = []
+    for m in [*site, *research]:
+        m = " ".join(m.lower().split())
+        if not m or m in _GENERIC_MOTIFS or set(m.split()) <= _GENERIC_MOTIFS or any(m in o or o in m for o in out):
+            continue
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _register_shown(inputs: Inputs, pitch_id: str, client: str, campaign: str, text: str) -> None:
@@ -252,7 +299,7 @@ _LEVELS = [
     # name, summary chars, sources/section, snippet chars, trend posts, meme templates, pitch mode, brief chars, excerpt chars
     ("rich", 4000, 5, 1500, 40, 40, "full", 600, 0),
     ("standard", 1000, 3, 300, 20, 25, "excerpts", 380, 450),
-    ("compact", 800, 2, 220, 12, 10, "excerpts", 300, 320),
+    ("compact", 800, 2, 220, 10, 10, "excerpts", 300, 320),
     ("minimal", 600, 1, 160, 8, 8, "brief", 200, 0),
 ]
 
@@ -278,6 +325,28 @@ def _fmt_memes(memes: list[visuals.MemeTemplate], n: int) -> str:
     if not memes:
         return "Not available (don't request memes; use mock or ref visuals)."
     return "\n".join(f"{m.id} | {m.name} | {m.box_count}" for m in memes[:n])
+
+
+def _season_line(inputs: Inputs) -> str:
+    ident = inputs.identity
+    season = SEASONS.get(ident.season) if ident and ident.season else None
+    if not season:
+        return "MOMENT: none detected."
+    where = "named in the brief/research" if ident.season_source == "text" else "calendar guess for launch in ~2 weeks"
+    return f'MOMENT: {season.label} (key "{season.key}", {where}).'
+
+
+def _fmt_identity(inputs: Inputs) -> str:
+    """Brand identity block: the brand's real products/objects, colours, fonts, and the detected moment."""
+    ident = inputs.identity
+    if ident is None:
+        return f"BRAND IDENTITY: colours {', '.join(inputs.colors) or 'unknown'}.\n{_season_line(inputs)}"
+    parts = [f"site {ident.site_url}" if ident.site_url else "site not found"]
+    if ident.motifs:
+        parts.append("products/objects: " + ", ".join(ident.motifs[:6]))
+    parts.append("colours " + (", ".join(inputs.colors[:3]) or "unknown"))
+    parts.append(f"fonts {ident.heading_font}/{ident.body_font}")
+    return "BRAND IDENTITY: " + "; ".join(parts) + ".\n" + _season_line(inputs)
 
 
 def _fmt_services(services: list[Service]) -> str:
@@ -315,7 +384,7 @@ def _strategist_messages(inputs: Inputs, level: tuple) -> list:
         brand=inputs.brand, today=inputs.today, scale_rule=scale_rule, buckets=buckets, extras=extras,
         rules=CORE_RULES.format(brand=inputs.brand),
     )
-    themes_list = "; ".join(f"{k}: {v}" for k, v in themes.THEME_DESCRIPTIONS.items())
+    themes_list = "; ".join(f"{k} ({clip_text(v.split('.')[-2] if v.count('.') > 1 else v, 70)})" for k, v in themes.THEME_DESCRIPTIONS.items())
     human = (
         f"CLIENT BRIEF: {inputs.brief or 'none given (decide from research)'}\n"
         f"REQUESTED SCALE: {scale}\n\n"
@@ -324,7 +393,7 @@ def _strategist_messages(inputs: Inputs, level: tuple) -> list:
         f"MEME TEMPLATES (id | name | text boxes)\n{_fmt_memes(inputs.memes, n_memes)}\n\n"
         f"WLDD SERVICES\n{_fmt_services(inputs.services)}\n\n"
         f"PAST PITCHES (confidential; mechanics only)\n{_fmt_pitches(inputs, mode, brief_chars, excerpt_chars)}\n\n"
-        f"BRAND COLOURS (from logo): {', '.join(inputs.colors) or 'unknown'}\n"
+        f"{_fmt_identity(inputs)}\n"
         f"THEMES: {themes_list}\n\n"
         f"Write the strategy JSON for {inputs.brand}."
     )
@@ -449,6 +518,9 @@ def _normalise_strategy(strategy: Strategy, inputs: Inputs, profile: ScaleProfil
     for e in strategy.extra_slides:
         if e.after not in SECTIONS:
             e.after = "context"
+    strategy.season = (strategy.season or "").strip().lower()
+    if strategy.season not in SEASONS:
+        strategy.season = ""
     if strategy.theme.name not in themes.THEME_DESCRIPTIONS:
         strategy.theme.name = "bold_dark"
     if strategy.theme.accent_hint and not _HEX_RE.match(strategy.theme.accent_hint):
@@ -742,8 +814,18 @@ def _writer_messages(
         f"STRATEGY\n{_strategy_for_group(strategy, mine)}",
         f"WLDD SERVICES IN THIS PITCH\n{svc_lines}",
     ]
+    if inputs.identity and inputs.identity.motifs:
+        parts.append(
+            "BRAND OBJECTS (use these real products/objects in ideas and visual briefs): "
+            + ", ".join(inputs.identity.motifs[:6])
+        )
+    if strategy.season and strategy.season in SEASONS:
+        parts.append(f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it.")
     if needs_memes:
-        parts.append(f"MEME TEMPLATES (id | name | boxes)\n{_fmt_memes(inputs.memes, 15)}")
+        parts.append(
+            "MEME TEMPLATES (id | name | boxes): use ONLY these ids, each at most once, with exactly its number of boxes\n"
+            + _fmt_memes(inputs.memes, 15)
+        )
     if excerpts:
         shown = "\n---\n".join(clip_text(_scrub(e.text, inputs), excerpt_chars) for e in excerpts)
         parts.append(
@@ -786,12 +868,15 @@ def _fix_visual(v: dict[str, Any] | None, memes: dict[str, visuals.MemeTemplate]
     if v["want"] == "meme":
         template = memes.get(str(v.get("meme_template_id") or ""))
         boxes = [str(b) for b in (v.get("meme_boxes") or []) if b is not None]
-        if template is None or not any(b.strip() for b in boxes):
+        if not any(b.strip() for b in boxes) or not memes:
             v["want"] = "mock"
             if boxes and not v.get("brief"):
                 v["brief"] = " / ".join(boxes)
             v.pop("meme_template_id", None)
             v["meme_boxes"] = []
+        elif template is None:
+            v["meme_template_id"] = None  # not on the shortlist: _assign_memes picks one with this box count
+            v["meme_boxes"] = boxes[:5]
         else:
             v["meme_template_id"] = template.id
             v["meme_boxes"] = (boxes + [""] * template.box_count)[: template.box_count]
@@ -1288,6 +1373,7 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
     """Last-line rules in code: no @handles, no unsupported stats (targets excepted), cards with bodies."""
     research = inputs.research_text
     kpi = slide.layout == "kpi_table"
+    allow_targets = slide.layout not in NARRATIVE_LAYOUTS
 
     def fix(value: Any, key: str | None = None) -> Any:
         if isinstance(value, dict):
@@ -1296,8 +1382,11 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
             return [fix(v, key) for v in value]
         if isinstance(value, str) and value:
             out = strip_handles(value) if "@" in value else value
+            out = BANNED_PLATFORM_RE.sub("YouTube Shorts", out)
+            out = re.sub(r"YouTube Shorts(\s*(?:/|,|\+|and|&)\s*(?:YouTube |YT )?Shorts)+", "YouTube Shorts", out, flags=re.IGNORECASE)
+            out = re.sub(r"(?:YouTube |YT )?Shorts\s*(?:/|,|\+|and|&)\s*YouTube Shorts", "YouTube Shorts", out, flags=re.IGNORECASE)
             if not kpi and key not in PROPOSAL_KEYS:
-                stats = unsupported_stats(out, research)
+                stats = unsupported_stats(out, research, allow_targets=allow_targets)
                 stats += [m.group(0) for m in PRICE_RE.finditer(out)]
                 if stats:
                     logger.info("Softened unsupported stat(s) %s on slide %r", stats, slide.title)
@@ -1306,6 +1395,8 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
         return value
 
     data = fix(slide.model_dump())
+    if isinstance(data.get("hook"), str):
+        data["hook"] = data["hook"].strip().strip("\"'\u201c\u201d\u2018\u2019").strip()  # the renderer adds quotes
     if slide.layout == "card_grid":
         cards = data.get("cards") or []
         for card in cards:
@@ -1320,6 +1411,45 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
     except ValidationError as exc:
         logger.warning("Cleaning slide %r broke it (%s); kept the original", slide.title, str(exc)[:160])
         return slide
+
+
+def _assign_memes(slides: list[Any], inputs: Inputs) -> None:
+    """Every meme uses a shortlist template, none twice in the deck, none from the brand's last decks;
+    a template that breaks that is swapped for one with the same box count (captions carry over)."""
+    shortlist = list(inputs.memes)
+    by_id = {m.id: m for m in shortlist}
+    try:
+        recent = memes.recently_used(inputs.brand)
+    except Exception:  # noqa: BLE001 - history is optional
+        recent = set()
+    used: set[str] = set()
+    for v in (v for s in slides for v in _slide_visuals(s) if v.want == "meme"):
+        boxes = [b for b in v.meme_boxes if b and b.strip()]
+        current = by_id.get(v.meme_template_id or "")
+        if current is None or current.id in used or current.id in recent:
+            n_boxes = current.box_count if current else len(boxes)
+            repl = memes.choose_replacement(current, n_boxes, used, recent, shortlist, v.brief or "")
+            if repl is None and current is not None and current.id not in used:
+                repl = current  # only a recent-use clash and nothing else fits: keep it
+            if repl is None:
+                v.want, v.meme_template_id, v.meme_boxes = "mock", None, []
+                v.brief = v.brief or " / ".join(boxes)
+                continue
+            if current is None or repl.id != current.id:
+                logger.info("Meme %s -> %s (%s)", v.meme_template_id or "-", repl.id, repl.name)
+            current = repl
+        used.add(current.id)
+        v.meme_template_id = current.id
+        v.meme_boxes = (list(v.meme_boxes) + [""] * current.box_count)[: current.box_count]
+
+
+def _slide_visuals(slide: Any) -> list[Visual]:
+    out: list[Visual] = []
+    if getattr(slide, "visual", None):
+        out.append(slide.visual)
+    out += list(getattr(slide, "visuals", []) or [])
+    out += [c.visual for c in getattr(slide, "cards", []) or [] if c.visual]
+    return out
 
 
 def _fix_all_visuals(slides: list[Any], memes: dict[str, visuals.MemeTemplate]) -> None:
@@ -1338,6 +1468,38 @@ def _fix_all_visuals(slides: list[Any], memes: dict[str, visuals.MemeTemplate]) 
             )
             v.want, v.query = fixed["want"], fixed.get("query") or v.query
             v.meme_template_id, v.meme_boxes = fixed.get("meme_template_id"), fixed.get("meme_boxes", [])
+
+
+async def _refresh_shortlist(inputs: Inputs, strategy: Strategy) -> None:
+    """Writers get a shortlist fitted to the buckets; the strategist's picks stay valid."""
+    hints = [f"{b.name} {b.hook} {b.concept}" for b in strategy.buckets] or [inputs.brand]
+    fresh = await _safe(memes.meme_shortlist(inputs.brand, hints, n=15), [], "Meme shortlist (buckets)")
+    chosen = {b.visual.meme_template_id for b in strategy.buckets if b.visual.meme_template_id}
+    keep = [m for m in inputs.memes if m.id in chosen]
+    merged = {m.id: m for m in [*keep, *(m for m in fresh if m.box_count >= 1)]}
+    if merged:
+        inputs.memes = list(merged.values())
+    logger.info("Meme shortlist for writers: %s", [f"{m.id}:{m.name}:{m.box_count}" for m in inputs.memes])
+
+
+def _confirmed_season(inputs: Inputs, strategy: Strategy) -> str | None:
+    """Season passed to the theme only when the strategist builds the plan around it.
+
+    A calendar-only guess the strategist doesn't confirm just flavours image prompts; a moment
+    the strategist declines is downgraded to that too.
+    """
+    ident = inputs.identity
+    said = (strategy.season or "").strip().lower()
+    if said in SEASONS:
+        return said
+    # A moment the client's brief names is the brief: no strategist confirmation needed.
+    in_brief, source = detect_season_detail(date.today(), inputs.brief or "")
+    if in_brief and source == "text":
+        return in_brief
+    if ident and ident.season and ident.season_source == "text":
+        logger.info("Strategist did not build around %s; season only flavours prompts", ident.season)
+        ident.season_source = "calendar"
+    return None
 
 
 # =========================================================================== entry point
@@ -1382,6 +1544,7 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
             len(strategy.hacks), [p.name for p in strategy.services], strategy.theme.name,
         )
 
+        await _refresh_shortlist(inputs, strategy)
         items = build_slide_plan(strategy, profile, brand, has_memes=bool(inputs.memes))
         written = await _run_writers(inputs, strategy, items, profile)
 
@@ -1420,6 +1583,7 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
         _enforce_services(slides, strategy, inputs, services_idx)
         _fix_all_visuals(slides, inputs.meme_ids)
         slides = [_clean_slide(s, inputs) for s in slides]
+        _assign_memes(slides, inputs)
         residual = find_issues(slides, inputs.banned, inputs.research_text)
         if residual:
             logger.warning("Rule issues left after editing: %s", residual)
@@ -1427,8 +1591,9 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
         choice = themes.ThemeChoice(
             name=strategy.theme.name, accent_hint=strategy.theme.accent_hint or None, hero_prompt=strategy.theme.hero_prompt,
         )
+        season = _confirmed_season(inputs, strategy)
         try:
-            theme = themes.resolve_theme(choice, inputs.colors)
+            theme = themes.resolve_theme(choice, inputs.identity or inputs.colors, season=season)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Theme resolution failed (%s); using the default theme", exc)
             theme = Theme(name=choice.name)

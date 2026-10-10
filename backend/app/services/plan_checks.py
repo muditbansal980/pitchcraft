@@ -48,7 +48,7 @@ _GENERIC_TOKENS = {
 
 # Prices/budgets: currency amounts or explicit budget/fee words.
 PRICE_RE = re.compile(
-    r"(₹\s?\d|\brs\.?\s?\d|\binr\s?\d|\$\s?\d|\d[\d,.]*\s?(lakh|lakhs|crore|crores|cr)\b|"
+    r"(₹\s?\d[\d,.]*\s?(?:k|m|mn|b|bn|lakh|lakhs|crore|crores|cr)?\b|\brs\.?\s?\d|\binr\s?\d|\$\s?\d|\d[\d,.]*\s?(lakh|lakhs|crore|crores|cr)\b|"
     r"\bbudget of\b|\bcosts? (?:of|around|about)\b|\bfees?\b|\bpriced at\b)",
     re.IGNORECASE,
 )
@@ -202,12 +202,14 @@ def find_issues(slides: list[Any], banned: list[str], research_text: str = "") -
                 found.append(f"mentions confidential name '{term}'")
         if PRICE_RE.search(full):
             found.append("mentions a price/budget/fee")
+        if BANNED_PLATFORM_RE.search(full):
+            found.append("mentions TikTok, which is banned in India (use Instagram Reels / YouTube Shorts)")
         handles = HANDLE_RE.findall(full)
         if handles:
             found.append("names creator handles " + ", ".join(sorted(set(handles))[:5]) + " (use archetype + tier)")
         layout = getattr(slide, "layout", "")
         if research_text and layout != "kpi_table":
-            stats = unsupported_stats(_claims_text(slide), research_text)
+            stats = unsupported_stats(_claims_text(slide), research_text, allow_targets=layout not in NARRATIVE_LAYOUTS)
             if stats:
                 found.append("statistic not in the research: " + ", ".join(stats[:4]) + " (remove, or label it as a target)")
         title = getattr(slide, "title", "") or ""
@@ -238,39 +240,60 @@ def find_issues(slides: list[Any], banned: list[str], research_text: str = "") -
 HANDLE_RE = re.compile(r"(?<![\w.])@[A-Za-z0-9_.]{2,30}")
 # Statistic-like numbers: percentages, multipliers and big counts ("27%", "3x", "2.4M", "10 crore", "1 billion").
 STAT_RE = re.compile(
-    r"(?<![\w.])(\d+(?:[.,]\d+)?)\s?(%|x\b|×|m\b|mn\b|million|b\b|bn\b|billion|crore|cr\b|lakh|k\b)",
+    r"(?<![\w.])(\.?\d+(?:[.,]\d+)?)\s?(%|x\b|×|m\b|mn\b|million|b\b|bn\b|billion|crore|cr\b|lakh|k\b)",
     re.IGNORECASE,
 )
 _TIER_CONTEXT = re.compile(r"\b(nano|micro|mid|macro|mega|tier|followers?|upto|up to|under|over)\b[^.]*$", re.IGNORECASE)
+# Slides that state facts (context, tension, insight): a figure there is a claim even if called a "target".
+NARRATIVE_LAYOUTS = {"cover", "statement", "from_to", "formula", "divider", "two_column", "ref"}
+BANNED_PLATFORM_RE = re.compile(r"\btik\s?tok\b", re.IGNORECASE)
 # Fields that hold our proposals (creator tiers, scale, timing), never claims about the brand or market.
 PROPOSAL_KEYS = {"creator", "scalability", "format", "when", "tags", "query", "brief", "meme_boxes"}
 _TARGET_CONTEXT = re.compile(r"target|goal|aim|we will|we'll|plan to|month \d|week \d|kpi", re.IGNORECASE)
 
 
 def _norm_number(num: str) -> str:
-    return num.replace(",", "")
+    return num.replace(",", "").rstrip("0").rstrip(".") if "." in num else num.replace(",", "")
 
 
-def unsupported_stats(text: str, research_text: str) -> list[str]:
+# Research figures, incl. spelled-out units ("1.2 million", "17 %", "₹6,500 crore").
+_FIGURE_RE = re.compile(
+    r"(?<![\w.])(\d+(?:[.,]\d+)?)\s?(%|percent|x\b|×|m\b|mn\b|million|b\b|bn\b|billion|crore|cr\b|lakh|k\b|thousand)",
+    re.IGNORECASE,
+)
+_UNITS = {"%": "pct", "percent": "pct", "x": "x", "×": "x", "m": "M", "mn": "M", "million": "M", "b": "B", "bn": "B",
+          "billion": "B", "crore": "cr", "cr": "cr", "lakh": "lakh", "k": "K", "thousand": "K"}
+
+
+def _unit(raw: str) -> str:
+    return _UNITS.get(raw.lower(), raw.lower())
+
+
+def unsupported_stats(text: str, research_text: str, allow_targets: bool = True) -> list[str]:
     """Statistic-like numbers in ``text`` that the research never states (targets excepted).
 
     A number is supported when the same figure appears in the research; it is a
     target when the 40 characters before it say so ("Target: 2M views").
     """
-    research_numbers = {_norm_number(m.group(1)) for m in STAT_RE.finditer(research_text)}
-    research_numbers |= {_norm_number(n) for n in re.findall(r"\d+(?:[.,]\d+)?", research_text)}
+    research_figures: dict[tuple[str, str], list[str]] = {}
+    for m in _FIGURE_RE.finditer(research_text):
+        key = (_norm_number(m.group(1)), _unit(m.group(2)))
+        research_figures.setdefault(key, []).append(research_text[m.end() : m.end() + 80].lower())
     found = []
     for m in STAT_RE.finditer(text):
-        num = _norm_number(m.group(1))
-        if num in research_numbers:
-            continue
+        key = (_norm_number(m.group(1)), _unit(m.group(2)))
+        if key in research_figures:
+            # Same figure and unit; it must also count the same thing ("1.2M followers" != "1.2M restaurants").
+            noun = re.match(r"[\s+]*(?:of\s+|monthly\s+|active\s+|more\s+)?([a-z]{4,})", text[m.end() : m.end() + 30].lower())
+            if not noun or any(noun.group(1)[:5] in after for after in research_figures[key]):
+                continue
         before = text[max(0, m.start() - 40) : m.start()]
-        if _TARGET_CONTEXT.search(before):
+        if allow_targets and _TARGET_CONTEXT.search(before):
             continue
         # Creator tiers and ranges are proposals, not facts: "micro 50-200K", "100K+ followers".
         if re.search(r"\d\s*[-–‑~]\s*$", before) or _TIER_CONTEXT.search(before[-25:]):
             continue
-        if re.match(r"\s*(\+|\s*followers|\s*[-–‑])", text[m.end() : m.end() + 12]):
+        if re.match(r"\s*\+?\s*(followers|subs|subscribers)|\s*[-–‑]\s*\d", text[m.end() : m.end() + 16]):
             continue
         found.append(m.group(0).strip())
     return found
@@ -287,16 +310,16 @@ def strip_handles(text: str) -> str:
 
 
 def soften_stats(text: str, stats: list[str]) -> str:
-    """Remove sentences that carry an unsupported statistic; if that empties the text, drop just the figure."""
+    """Remove the sentences (or, in a one-sentence field, the clauses) that carry an unsupported figure."""
     if not stats:
         return text
     sentences = re.split(r"(?<=[.!?])\s+", text)
     kept = [s for s in sentences if not any(st in s for st in stats)]
-    if kept and len(kept) < len(sentences):
+    if kept:
         return " ".join(kept)
-    for st in stats:
-        text = text.replace(st, "").replace("  ", " ")
-    return text.strip()
+    clauses = re.split(r"\s*(?:;|,|\u2014|\s-\s|\|)\s*", text)
+    kept = [c for c in clauses if c.strip() and not any(st in c for st in stats)]
+    return ", ".join(kept).strip(" ,;:")
 
 
 def similar_titles(a: str, b: str) -> bool:

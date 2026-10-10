@@ -19,6 +19,8 @@ the next ~8 weeks, build around it and time the plan to it; if it just ended, ri
 next one. Never ignore a moment happening right now. Cricket, OTT drops, festivals and trending formats are \
 fair game as cultural moments.
 - Spell {brand} exactly as given.
+- Platforms are Indian: Instagram (Reels, Stories, Lives), YouTube (Shorts), X, WhatsApp, ShareChat/Moj, \
+Snapchat. TikTok is banned in India: never mention it.
 - Recommend only WLDD SERVICES, with their exact names. No prices, fees, budgets or costs anywhere.
 - PAST PITCHES are confidential pitches for other brands. Borrow mechanics silently; never mention them, \
 their brands, campaigns, shows, cast or any creator/influencer/partner page named in them; don't quote them; \
@@ -66,6 +68,9 @@ THE BAR (invented examples for other brands; never reuse them):
 - Hack "Comment BERTH" (rail app): people comment their worst upper-berth story, the best one wins a ticket, the pinned thread becomes next week's reel.
 Generic is failure: "engaging memes about X", "relatable content", "a community for fans" say nothing.
 
+Use the brand's real products/objects from BRAND IDENTITY in buckets, hooks and visual prompts. Build around \
+the MOMENT only if it fits the brief (a calendar guess never overrides what the brief asks for).
+
 Sketch 3 genuinely different routes for the big idea, keep the strongest ("chosen" = its index).
 
 Return ONE JSON object (keep every string short; no markdown):
@@ -80,13 +85,14 @@ Return ONE JSON object (keep every string short; no markdown):
   "format": "platform + duration", "creator": "archetype + tier", "scalability": "<=25 words",
   "distribution": ["handle category"], "slides": ["idea", "samples"|"ref"],
   "visual": {{"ref_query": "web image search for a real reference post", "reddit_hint": "reddit search words",
-  "meme_template_id": "id from MEME TEMPLATES or ''", "mock_prompt": "AI image prompt for a sample visual"}}}}],
+  "meme_template_id": "id from MEME TEMPLATES only, or ''", "mock_prompt": "AI image prompt for a sample visual"}}}}],
 "hacks": [{{"name": "...", "mechanic": "<=30 words"}}],
 "distribution": [{{"category": "handle category, e.g. meme pages, pop-culture pages, regional handles, fan pages, niche (book/food/cricket) pages", "why": "<=15 words"}}],
 "services": [{{"name": "exact WLDD service name", "why": "<=20 words, tied to {brand}", "what": "<=30 words: formats, volumes, tiers"}}],
-"phases": [{{"name": "...", "when": "granularity matched to the campaign: hours/days for a burst, weeks for a launch, months for always-on", "points": ["..."]}}],
+"phases": [{{"name": "...", "when": "granularity matched to the campaign: hours/days for a burst, weeks for a launch, months for always-on; never before today", "points": ["..."]}}],
 "kpis": [{{"metric": "...", "target": "Target: ...", "how": "how we measure"}}],
-"theme": {{"name": "one of THEMES", "accent_hint": "#RRGGBB if no brand colour fits", "hero_prompt": "cover background image prompt, no text, no logos"}},
+"season": "the MOMENT key if the plan is built around that moment, else ''",
+"theme": {{"name": "one of THEMES", "accent_hint": "#RRGGBB if no brand colour fits", "hero_prompt": "cover image prompt featuring the brand's real products/objects (+ the moment), no text, no logos"}},
 "extra_slides": [{{"after": "context|tension|idea|buckets|hacks|plan", "layout": "statement|from_to|formula|card_grid|two_column|table|chips|timeline", "title": "...", "brief": "what the slide argues"}}]}}
 
 Counts by scale: buckets {buckets} (this is a hard requirement: write that many distinct buckets); hacks focused 0-1, standard 2-3, flagship 3-4; phases 2-5; kpis 3-6; \

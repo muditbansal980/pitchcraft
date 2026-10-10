@@ -146,6 +146,7 @@ class Strategy(_Lenient):
     services: Annotated[list[ServicePick], _objects("name")] = []
     phases: Annotated[list[PhasePlan], _objects("name")] = []
     kpis: Annotated[list[Kpi], _objects("metric")] = []
+    season: Str = ""
     theme: ThemePick = ThemePick()
     extra_slides: Annotated[list[ExtraSlide], _objects("title")] = []
 
