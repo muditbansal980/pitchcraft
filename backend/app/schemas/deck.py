@@ -66,7 +66,10 @@ class Visual(BaseModel):
 
 class _Slide(BaseModel):
     title: Text(90)
-    notes: Text(1200) = Field("", description="Speaker notes: the longer explanation behind the slide")
+    notes: Text(2000) = Field("", description="Speaker notes: the longer explanation behind the slide")
+    sources: Annotated[list[Text(120)], BeforeValidator(_take(4))] = Field(
+        default_factory=list, description="Short source labels (dossier facts) rendered as a footnote"
+    )
 
 
 class CoverSlide(_Slide):
@@ -79,6 +82,9 @@ class StatementSlide(_Slide):
     layout: Literal["statement"] = "statement"
     strip: Text(160) = Field("", description="Highlight-strip subtitle under the headline")
     body: Text(400) = ""
+    bullets: Annotated[list[Text(160)], BeforeValidator(_take(4))] = Field(
+        default_factory=list, description="Up to 4 supporting points (e.g. sourced stats)"
+    )
 
 
 class FromToSlide(_Slide):
@@ -119,11 +125,23 @@ class DividerSlide(_Slide):
 
 class IdeaSlide(_Slide):
     layout: Literal["idea"] = "idea"
-    concept_note: Text(500)
+    concept_note: Text(700)
     hook: Text(160) = ""
     format: Text(120) = Field("", description='Platform + duration, e.g. "IG reel, 45s"')
     creator: Text(160) = Field("", description="Creator archetype + tier")
     scalability: Text(300) = ""
+    execution: Annotated[list[Text(140)], BeforeValidator(_take(5))] = Field(
+        default_factory=list, description="3-5 numbered execution steps"
+    )
+    sample_posts: Annotated[list[Text(200)], BeforeValidator(_take(3))] = Field(
+        default_factory=list, description="2-3 sample captions / script beats"
+    )
+    services: Annotated[list[Text(40)], BeforeValidator(_take(4))] = Field(
+        default_factory=list, description="WLDD services powering this idea (exact catalog names)"
+    )
+    service_mechanics: Text(300) = Field(
+        "", description='How those services run it, e.g. "Memed: 40 creators x 2 clips; Amplification: 25 meme pages, 3 waves"'
+    )
     visual: Visual | None = None
 
 

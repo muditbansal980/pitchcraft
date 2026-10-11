@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.brand import ResearchSection
 from app.schemas.deck import Deck, PlanScale, ResolvedScale
+from app.schemas.research import BrandDossier
 
 
 class BrandPlanRequest(BaseModel):
@@ -30,3 +31,5 @@ class BrandPlanResponse(BaseModel):
     brief: str | None = None
     # Always set by the v2 pipeline; optional so older clients/saved researches still parse.
     deck: Deck | None = None
+    # Deep-research dossier the deck was grounded in (sources shown in the research panel).
+    dossier: BrandDossier | None = None
