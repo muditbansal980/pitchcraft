@@ -193,36 +193,38 @@ def _window_months(start: date, end: date) -> set[int]:
     return months
 
 
-def fix_event_dates(text: str, today: date) -> str:
-    """Correct dates the LLM attached to a known moment, e.g. "IPL 2026 (matches Oct-Nov 2026)".
+def fix_dates_for(text: str, keyword: str, start: date, end: date, today: date, label: str | None = None) -> str:
+    """Within ~60 chars after ``keyword``: a month span outside [start, end] becomes that window, and a
+    year before the window's year next to the keyword is bumped to it."""
+    kw_re = r"(?<![A-Za-z])" + re.escape(keyword) + r"(?![A-Za-z])"
+    if not text or not re.search(kw_re, text, re.IGNORECASE):
+        return text
+    ok_months = _window_months(start, end)
 
-    Within ~60 chars after a season keyword: a month span outside that season's real window is
-    replaced with the window, and a past year next to the keyword is bumped to the window's year.
+    def bump_year(m: re.Match) -> str:
+        # The next real window is in a later year, so "<moment> <past year>" is a season that's over.
+        return f"{m.group(1)}{start.year}" if int(m.group(2)) < start.year else m.group(0)
+
+    def fix_span(m: re.Match) -> str:
+        months = _months_in(m.group(2))
+        return m.group(1) + (label or _span(start, end)) if months and not months <= ok_months else m.group(0)
+
+    text = re.sub(rf"({kw_re}\s+)(20\d\d)\b", bump_year, text, flags=re.IGNORECASE)
+    return re.sub(rf"({kw_re}[^.;\n]{{0,60}}?)({_MONTH_SPAN})", fix_span, text, flags=re.IGNORECASE)
+
+
+def fix_event_dates(text: str, today: date, skip: set[str] | None = None) -> str:
+    """Calendar fallback: correct dates attached to a known moment, e.g. "IPL 2026 (matches Oct-Nov 2026)".
+
+    ``skip`` holds lower-cased keywords already corrected from verified, sourced dates.
     """
     if not text:
         return text
     for season in SEASONS.values():
-        window = season_window(season.key, today)
-        if not window:
+        if skip and any(kw in skip for kw in season.keywords):
             continue
-        start, end = window
-        ok_months = _window_months(start, end)
-        for kw in season.keywords:
-            kw_re = r"(?<![A-Za-z])" + re.escape(kw) + r"(?![A-Za-z])"
-            if not re.search(kw_re, text, re.IGNORECASE):
-                continue
-
-            def bump_year(m: re.Match) -> str:
-                # The next real window is in a later year, so "<moment> <past year>" is a season that's over.
-                return f"{m.group(1)}{start.year}" if int(m.group(2)) < start.year else m.group(0)
-
-            text = re.sub(rf"({kw_re}\s+)(20\d\d)\b", bump_year, text, flags=re.IGNORECASE)
-
-            def fix_span(m: re.Match) -> str:
-                months = _months_in(m.group(2))
-                if months and not months <= ok_months:
-                    return m.group(1) + _span(start, end)
-                return m.group(0)
-
-            text = re.sub(rf"({kw_re}[^.;\n]{{0,60}}?)({_MONTH_SPAN})", fix_span, text, flags=re.IGNORECASE)
+        window = season_window(season.key, today)
+        if window:
+            for kw in season.keywords:
+                text = fix_dates_for(text, kw, window[0], window[1], today)
     return text

@@ -126,6 +126,13 @@ from app.services.plan_models import (
     ServicePick,
     Strategy,
 )
+from app.services.plan_moments import (
+    add_moment_facts,
+    covered_keywords,
+    fix_moment_dates,
+    moments_prompt,
+    verify_moments,
+)
 from app.services.plan_prompts import (
     CORE_RULES,
     EDITOR_SYSTEM,
@@ -214,6 +221,8 @@ class Inputs:
     shown_pitches: dict[str, tuple[str, str]] = field(default_factory=dict)
     banned: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
+    # Real-world events the strategy builds on, with dates read from live sources (plan_moments).
+    moments: list[Any] = field(default_factory=list)
 
     @property
     def meme_ids(self) -> dict[str, visuals.MemeTemplate]:
@@ -436,6 +445,26 @@ def _fmt_memes(memes: list[visuals.MemeTemplate], n: int) -> str:
     if not memes:
         return "Not available (don't request memes; use mock or ref visuals)."
     return "\n".join(f"{m.id} | {m.name} | {m.box_count}" for m in memes[:n])
+
+
+def _fix_dates(text: str, inputs: Any) -> str:
+    """Verified (sourced) event dates first, then the built-in calendar for moments not verified."""
+    moments = getattr(inputs, "moments", None) or []
+    text = fix_moment_dates(text, moments, date.today())
+    return fix_event_dates(text, date.today(), skip=covered_keywords(moments))
+
+
+def _apply_moments(inputs: Inputs, strategy: Strategy) -> None:
+    """Verified dates become sourced facts, and the strategy's own text is corrected before writers see it."""
+    if not inputs.moments:
+        return
+    add_moment_facts(inputs.dossier, inputs.moments)
+    inputs.refresh_corpus()
+    strategy.why_now = _fix_dates(strategy.why_now, inputs)
+    strategy.moment = _fix_dates(strategy.moment, inputs)
+    for phase in strategy.phases:
+        if getattr(phase, "when", None):
+            phase.when = _fix_dates(phase.when, inputs)
 
 
 def _moment_rule(key: str) -> str:
@@ -1062,11 +1091,14 @@ def _writer_messages(
             "BRAND OBJECTS (use these real products/objects in ideas and visual briefs): "
             + ", ".join(inputs.identity.motifs[:6])
         )
+    verified = moments_prompt(inputs.moments, date.today())
     if strategy.season and strategy.season in SEASONS:
         parts.append(
             f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it. "
-            + _moment_rule(strategy.season)
+            + ("" if verified else _moment_rule(strategy.season))
         )
+    if verified:
+        parts.append(verified)
     if needs_memes:
         parts.append(
             "MEME TEMPLATES (id | name | boxes): use ONLY these ids, each at most once, with exactly its number of boxes\n"
@@ -1799,7 +1831,7 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
                 cited.extend(extract_fact_ids(value))
                 value = strip_fact_ids(value)
             out = strip_handles(value) if "@" in value else value
-            out = fix_event_dates(out, date.today())
+            out = _fix_dates(out, inputs)
             out = BANNED_PLATFORM_RE.sub("YouTube Shorts", out)
             out = _FILLER_RE.sub(lambda m: _match_case(m.group(0), _FILLER_FIX[m.group(0).lower()]), out)
             out = re.sub(r"YouTube Shorts(\s*(?:/|,|\+|and|&)\s*(?:YouTube |YT )?Shorts)+", "YouTube Shorts", out, flags=re.IGNORECASE)
@@ -1995,10 +2027,13 @@ async def generate_brand_plan(
         # Services woven in: a second strategy call decides fit, combo, per-bucket powering and the matrix.
         t = time.monotonic()
         dossier_view = render_dossier(inputs.dossier, 5000) if inputs.dossier else ""
-        planned, _ = await asyncio.gather(
+        planned, _, inputs.moments = await asyncio.gather(
             plan_services(brand, brief, inputs.today, strategy, resolved, inputs.services, inputs.playbooks, dossier_view),
             _refresh_shortlist(inputs, strategy),
+            # Never trust the model's memory for event dates: verify them against live sources.
+            verify_moments(strategy, date.today()),
         )
+        _apply_moments(inputs, strategy)
         inputs.service_plan = normalise_plan(planned, strategy, inputs.services, resolved)
         inputs.timings["services"] = time.monotonic() - t
         sp = inputs.service_plan
