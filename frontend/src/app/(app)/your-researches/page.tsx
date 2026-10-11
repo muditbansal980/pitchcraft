@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { DeckActions } from "@/components/deck-actions";
+import { DossierPanel } from "@/components/dossier-panel";
 import { PlanMarkdown } from "@/components/plan-markdown";
 import { DownloadReportButton } from "@/components/download-report-button";
 import { ResearchSources } from "@/components/research-sources";
@@ -87,6 +88,7 @@ export default function YourResearchesPage() {
                     </div>
                   )}
                   <PlanMarkdown>{item.plan}</PlanMarkdown>
+                  {item.dossier && <DossierPanel dossier={item.dossier} />}
                   <ResearchSources research={item.research} />
                   <div className="flex flex-wrap gap-3">
                     <DownloadReportButton research={item} />

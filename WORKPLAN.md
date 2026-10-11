@@ -218,5 +218,5 @@ Why: user feedback 2026-10-11. Deck content is thin (compact context: 800-char s
 - [ ] Agent D — deep research + service playbooks
 - [ ] Agent A — dossier-grounded, per-bucket generation + services woven in
 - [ ] Agent B — renderer for execution/sample posts/services/bullets/footnotes
-- [ ] Agent C — plan jobs + progress UI + dossier panel
+- [x] Agent C — plan jobs + progress UI + dossier panel. **Accepted** (coordinator re-ran eslint, tsc, 8/8 job tests). Headless-browser run: real stage polling, reload mid-job resumes, dossier panel, Powered-by tiles. Waits on A's `on_stage` for live stages (falls back without it). Jobs are per-process (single uvicorn worker).
 - [ ] Integration (v2 vs v3 comparison) + PR
