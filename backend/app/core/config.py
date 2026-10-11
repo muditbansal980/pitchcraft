@@ -29,13 +29,20 @@ class Settings(BaseSettings):
     groq_reasoning_effort: str = "low"
 
     # Google AI Studio (Gemini): strategist, editor and image picking.
-    # GOOGLE_API_KEY (also accepted as GEMINI_API_KEY).
-    google_api_key: str | None = Field(None, validation_alias=AliasChoices("google_api_key", "gemini_api_key"))
+    # GOOGLE_API_KEY (also accepted as GEMINI_API_KEY or GOOGLE_AI_STUDIO_KEY).
+    google_api_key: str | None = Field(None, validation_alias=AliasChoices("google_api_key", "gemini_api_key", "google_ai_studio_key"))
     # Role -> ordered "provider:model" list (see app/services/llm_router.py). Groq limits are
     # per model and Gemini has its own quota, so spreading roles saves the free tiers.
     # Set as JSON in .env, e.g. LLM_ROLES='{"writer": ["groq:openai/gpt-oss-120b"]}'.
     llm_roles: dict[str, list[str]] = {
-        "strategist": ["gemini:gemini-3.8-flash", "groq:openai/gpt-oss-120b", "groq:openai/gpt-oss-20b"],
+        # Several Gemini models first: one can return 503 "high demand" while the others answer.
+        "strategist": [
+            "gemini:gemini-3.8-flash",
+            "gemini:gemini-3.7-flash",
+            "gemini:gemini-3.5-flash",
+            "groq:openai/gpt-oss-120b",
+            "groq:openai/gpt-oss-20b",
+        ],
         "writer": [
             "groq:openai/gpt-oss-120b",
             "groq:openai/gpt-oss-20b",
@@ -45,11 +52,13 @@ class Settings(BaseSettings):
         ],
         "editor": [
             "gemini:gemini-3.8-flash",
+            "gemini:gemini-3.7-flash",
+            "gemini:gemini-3.5-flash",
             "groq:openai/gpt-oss-120b",
             "groq:openai/gpt-oss-20b",
             "groq:qwen/qwen3.8-27b",
         ],
-        "vision": ["gemini:gemini-3.8-flash"],
+        "vision": ["gemini:gemini-3.8-flash", "gemini:gemini-3.7-flash", "gemini:gemini-3.5-flash"],
         # Many small parallel calls that condense scraped pages into the brand dossier.
         "distiller": [
             "groq:openai/gpt-oss-20b",
