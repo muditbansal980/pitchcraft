@@ -93,7 +93,7 @@ from app.services.plan_services import (
     plan_services,
 )
 from app.services.brand_identity import BrandIdentity
-from app.services.brand_identity_season import SEASONS, detect_season_detail
+from app.services.brand_identity_season import SEASONS, detect_season_detail, fix_event_dates, season_timing
 from app.services.brand_research import research_brand
 from app.services.plan_checks import (
     BANNED_PLATFORM_RE,
@@ -425,13 +425,22 @@ def _fmt_memes(memes: list[visuals.MemeTemplate], n: int) -> str:
     return "\n".join(f"{m.id} | {m.name} | {m.box_count}" for m in memes[:n])
 
 
+def _moment_rule(key: str) -> str:
+    """Real calendar dates for the moment, so the LLM never moves an event to fit 'now'."""
+    timing = season_timing(key, date.today())
+    if not timing:
+        return ""
+    return (f"Calendar truth (today {date.today():%d %b %Y}): {timing}. Never change a moment's real dates; "
+            "if it is weeks or months away, pitch a build-up/pre-season plan timed to the real window.")
+
+
 def _season_line(inputs: Inputs) -> str:
     ident = inputs.identity
     season = SEASONS.get(ident.season) if ident and ident.season else None
     if not season:
         return "MOMENT: none detected."
     where = "named in the brief/research" if ident.season_source == "text" else "calendar guess for launch in ~2 weeks"
-    return f'MOMENT: {season.label} (key "{season.key}", {where}).'
+    return f'MOMENT: {season.label} (key "{season.key}", {where}). {_moment_rule(season.key)}'
 
 
 def _fmt_identity(inputs: Inputs) -> str:
@@ -1041,7 +1050,10 @@ def _writer_messages(
             + ", ".join(inputs.identity.motifs[:6])
         )
     if strategy.season and strategy.season in SEASONS:
-        parts.append(f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it.")
+        parts.append(
+            f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it. "
+            + _moment_rule(strategy.season)
+        )
     if needs_memes:
         parts.append(
             "MEME TEMPLATES (id | name | boxes): use ONLY these ids, each at most once, with exactly its number of boxes\n"
@@ -1774,6 +1786,7 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
                 cited.extend(extract_fact_ids(value))
                 value = strip_fact_ids(value)
             out = strip_handles(value) if "@" in value else value
+            out = fix_event_dates(out, date.today())
             out = BANNED_PLATFORM_RE.sub("YouTube Shorts", out)
             out = _FILLER_RE.sub(lambda m: _match_case(m.group(0), _FILLER_FIX[m.group(0).lower()]), out)
             out = re.sub(r"YouTube Shorts(\s*(?:/|,|\+|and|&)\s*(?:YouTube |YT )?Shorts)+", "YouTube Shorts", out, flags=re.IGNORECASE)

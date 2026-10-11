@@ -141,3 +141,88 @@ def detect_season_detail(today: date, text: str) -> tuple[str | None, str | None
 
 def get_season(key: str | None) -> Season | None:
     return SEASONS.get(key or "")
+
+
+# --------------------------------------------------------------------------- calendar truth for prompts/checks
+
+_MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
+_DAY = r"(?:\s*\d{1,2}(?!\d))?"
+_MONTH_SPAN = rf"{_MONTH}{_DAY}(?:\s*(?:-|–|—|to)\s*(?:{_MONTH})?{_DAY})?(?:,?\s*20\d\d)?"
+
+
+def season_window(key: str | None, today: date) -> tuple[date, date] | None:
+    """The live or next real window for a season (approximate for fixed-calendar moments)."""
+    cands: list[tuple[date, date]] = []
+    for year in (today.year, today.year + 1):
+        cands += [(s, e) for s, e, k in _BY_YEAR.get(year, []) if k == key]
+        for (sm, sd), (em, ed), k in _FIXED:
+            if k == key:
+                cands.append((date(year, sm, sd), date(year, em, ed)))
+    upcoming = [(s, e) for s, e in cands if e >= today]
+    return min(upcoming) if upcoming else None
+
+
+def _span(start: date, end: date) -> str:
+    if start.year == end.year:
+        return f"{start.day} {start:%b}–{end.day} {end:%b} {end.year}"
+    return f"{start.day} {start:%b} {start.year}–{end.day} {end:%b} {end.year}"
+
+
+def season_timing(key: str | None, today: date) -> str | None:
+    """'IPL season is NOT live now: next window ~20 Mar–31 May 2027, ~23 weeks away' (or live now)."""
+    season, window = SEASONS.get(key or ""), season_window(key, today)
+    if not season or not window:
+        return None
+    start, end = window
+    if start <= today:
+        return f"{season.label} is live now (~{_span(start, end)})"
+    weeks = max(1, (start - today).days // 7)
+    return f"{season.label} is NOT live now: next window ~{_span(start, end)}, ~{weeks} week{'s' if weeks > 1 else ''} away"
+
+
+def _months_in(text: str) -> set[int]:
+    return {_MONTH_NAMES.index(m.group(0)[:3].lower()) + 1 for m in re.finditer(_MONTH, text)}
+
+
+def _window_months(start: date, end: date) -> set[int]:
+    months, d = set(), date(start.year, start.month, 1)
+    while d <= end:
+        months.add(d.month)
+        d = date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+    return months
+
+
+def fix_event_dates(text: str, today: date) -> str:
+    """Correct dates the LLM attached to a known moment, e.g. "IPL 2026 (matches Oct-Nov 2026)".
+
+    Within ~60 chars after a season keyword: a month span outside that season's real window is
+    replaced with the window, and a past year next to the keyword is bumped to the window's year.
+    """
+    if not text:
+        return text
+    for season in SEASONS.values():
+        window = season_window(season.key, today)
+        if not window:
+            continue
+        start, end = window
+        ok_months = _window_months(start, end)
+        for kw in season.keywords:
+            kw_re = r"(?<![A-Za-z])" + re.escape(kw) + r"(?![A-Za-z])"
+            if not re.search(kw_re, text, re.IGNORECASE):
+                continue
+
+            def bump_year(m: re.Match) -> str:
+                # The next real window is in a later year, so "<moment> <past year>" is a season that's over.
+                return f"{m.group(1)}{start.year}" if int(m.group(2)) < start.year else m.group(0)
+
+            text = re.sub(rf"({kw_re}\s+)(20\d\d)\b", bump_year, text, flags=re.IGNORECASE)
+
+            def fix_span(m: re.Match) -> str:
+                months = _months_in(m.group(2))
+                if months and not months <= ok_months:
+                    return m.group(1) + _span(start, end)
+                return m.group(0)
+
+            text = re.sub(rf"({kw_re}[^.;\n]{{0,60}}?)({_MONTH_SPAN})", fix_span, text, flags=re.IGNORECASE)
+    return text
