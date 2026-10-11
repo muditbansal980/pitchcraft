@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,7 +29,8 @@ class Settings(BaseSettings):
     groq_reasoning_effort: str = "low"
 
     # Google AI Studio (Gemini): strategist, editor and image picking.
-    google_api_key: str | None = None
+    # GOOGLE_API_KEY (also accepted as GEMINI_API_KEY).
+    google_api_key: str | None = Field(None, validation_alias=AliasChoices("google_api_key", "gemini_api_key"))
     # Role -> ordered "provider:model" list (see app/services/llm_router.py). Groq limits are
     # per model and Gemini has its own quota, so spreading roles saves the free tiers.
     # Set as JSON in .env, e.g. LLM_ROLES='{"writer": ["groq:openai/gpt-oss-120b"]}'.
