@@ -33,7 +33,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -342,6 +342,8 @@ def _fmt_identity(inputs: Inputs) -> str:
     if ident is None:
         return f"BRAND IDENTITY: colours {', '.join(inputs.colors) or 'unknown'}.\n{_season_line(inputs)}"
     parts = [f"site {ident.site_url}" if ident.site_url else "site not found"]
+    if ident.products:
+        parts.append("named products/features: " + ", ".join(ident.products[:8]))
     if ident.motifs:
         parts.append("products/objects: " + ", ".join(ident.motifs[:6]))
     parts.append("colours " + (", ".join(inputs.colors[:3]) or "unknown"))
@@ -814,6 +816,11 @@ def _writer_messages(
         f"STRATEGY\n{_strategy_for_group(strategy, mine)}",
         f"WLDD SERVICES IN THIS PITCH\n{svc_lines}",
     ]
+    if inputs.identity and inputs.identity.products:
+        parts.append(
+            "BRAND PRODUCTS (name at least two of these where natural, spelled exactly): "
+            + ", ".join(inputs.identity.products[:8])
+        )
     if inputs.identity and inputs.identity.motifs:
         parts.append(
             "BRAND OBJECTS (use these real products/objects in ideas and visual briefs): "
@@ -1369,6 +1376,55 @@ def _duplicate_of(slide: Any, slides: list[Any]) -> int | None:
     return None
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+_DATE_RANGE_RE = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})"
+    r"(?:\s*[-\u2010-\u2014]\s*(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+)?(\d{1,2}))?\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_day(month: str, day: str, today: date) -> date | None:
+    try:
+        d = date(today.year, _MONTHS[month[:3].lower()], int(day))
+    except (KeyError, ValueError):
+        return None
+    # A month far behind today means next year's calendar (e.g. "Jan 5" written in October).
+    return d.replace(year=today.year + 1) if (today - d).days > 180 else d
+
+
+def _shift_past_timeline(data: dict, today: date) -> None:
+    """LLMs often start the rollout on dates that have already passed; move the whole timeline forward."""
+    phases = data.get("phases") or []
+    starts = []
+    for phase in phases:
+        m = _DATE_RANGE_RE.search(phase.get("when") or "")
+        if m and (d := _parse_day(m.group(1), m.group(2), today)):
+            starts.append(d)
+    if not starts or min(starts) >= today:
+        return
+    offset = (today + timedelta(days=3)) - min(starts)
+
+    def shift(m: re.Match) -> str:
+        start = _parse_day(m.group(1), m.group(2), today)
+        if start is None:
+            return m.group(0)
+        new_start = start + offset
+        out = f"{new_start:%b} {new_start.day}"
+        if m.group(4):
+            end = _parse_day(m.group(3) or m.group(1), m.group(4), today)
+            if end is not None:
+                new_end = end + offset
+                out += f"\u2013{new_end.day}" if new_end.month == new_start.month else f"\u2013{new_end:%b} {new_end.day}"
+        return out
+
+    for phase in phases:
+        if phase.get("when"):
+            phase["when"] = _DATE_RANGE_RE.sub(shift, phase["when"])
+    logger.info("Timeline %r started in the past; shifted forward by %d days", data.get("title"), offset.days)
+
+
 def _clean_slide(slide: Any, inputs: Inputs) -> Any:
     """Last-line rules in code: no @handles, no unsupported stats (targets excepted), cards with bodies."""
     research = inputs.research_text
@@ -1397,6 +1453,8 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
     data = fix(slide.model_dump())
     if isinstance(data.get("hook"), str):
         data["hook"] = data["hook"].strip().strip("\"'\u201c\u201d\u2018\u2019").strip()  # the renderer adds quotes
+    if slide.layout == "timeline":
+        _shift_past_timeline(data, date.today())
     if slide.layout == "card_grid":
         cards = data.get("cards") or []
         for card in cards:

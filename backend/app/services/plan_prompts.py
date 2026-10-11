@@ -68,7 +68,8 @@ THE BAR (invented examples for other brands; never reuse them):
 - Hack "Comment BERTH" (rail app): people comment their worst upper-berth story, the best one wins a ticket, the pinned thread becomes next week's reel.
 Generic is failure: "engaging memes about X", "relatable content", "a community for fans" say nothing.
 
-Use the brand's real products/objects from BRAND IDENTITY in buckets, hooks and visual prompts. Build around \
+Use the brand's real products/objects from BRAND IDENTITY in buckets, hooks and visual prompts, and name at \
+least two of its named products/features where they fit the brief. Build around \
 the MOMENT only if it fits the brief (a calendar guess never overrides what the brief asks for).
 
 Sketch 3 genuinely different routes for the big idea, keep the strongest ("chosen" = its index).
