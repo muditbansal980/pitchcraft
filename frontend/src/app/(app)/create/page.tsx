@@ -1,23 +1,34 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { DeckActions } from "@/components/deck-actions";
+import { DossierPanel } from "@/components/dossier-panel";
 import { LoginRequiredDialog } from "@/components/login-required-dialog";
 import { PlanMarkdown } from "@/components/plan-markdown";
 import { ResearchSources } from "@/components/research-sources";
 import { SlideStrip } from "@/components/slide-strip";
 import { canvaReturnMessage, clearCanvaReturn, useCanvaReturn } from "@/lib/canva";
+import { MAX_BRIEF_CHARS } from "@/lib/plan-request";
+import {
+  clearPendingJob,
+  fetchPlanJob,
+  JOB_STAGES,
+  JobRequestError,
+  POLL_INTERVAL_MS,
+  stageIndex,
+  startPlanJob,
+  usePendingJob,
+  type PendingJob,
+} from "@/lib/plan-jobs";
 import { deleteUploadedReport, renderReport, reportFileName, uploadReport } from "@/lib/report-files";
 import { saveResearch, updateResearch, useResearches, type SavedResearch } from "@/lib/researches";
-import type { BrandPlan, PlanScale } from "@/lib/types";
+import type { BrandPlan, PlanJob, PlanScale } from "@/lib/types";
 
 type BrandPlanResponse = Partial<BrandPlan> & { error?: string };
 
 type PdfStatus = { state: "idle" | "saving" | "saved" } | { state: "failed"; error: string };
-
-const MAX_BRIEF_CHARS = 2000;
 
 const SCALE_OPTIONS: { value: PlanScale; label: string }[] = [
   { value: "auto", label: "Auto (fits the brief)" },
@@ -26,15 +37,8 @@ const SCALE_OPTIONS: { value: PlanScale; label: string }[] = [
   { value: "flagship", label: "Flagship · 30–45 slides" },
 ];
 
-// Rough timings of the generation pipeline, so the wait shows what's happening.
-const STAGES: { from: number; label: string }[] = [
-  { from: 0, label: "Researching the brand" },
-  { from: 12, label: "Reading the internet's mood" },
-  { from: 28, label: "Building the strategy" },
-  { from: 55, label: "Writing slides" },
-  { from: 90, label: "Finding memes & refs" },
-  { from: 130, label: "Designing the deck" },
-];
+// Polls that may fail in a row (server busy or restarting) before giving up.
+const MAX_POLL_FAILURES = 6;
 
 function formatElapsed(seconds: number) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
@@ -49,8 +53,10 @@ export default function CreatePage() {
   const [response, setResponse] = useState<BrandPlanResponse | null>(null);
   // The saved copy of the latest plan (gives the deck buttons a research id).
   const [saved, setSaved] = useState<SavedResearch | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
+  // POST /api/brand-plan/jobs in flight; afterwards the pending job drives the UI.
+  const [starting, setStarting] = useState(false);
+  const [jobState, setJobState] = useState<{ id: string; stage: string; progress: number } | null>(null);
+  const [now, setNow] = useState(0);
   const [copied, setCopied] = useState(false);
   const [noticeDismissed, setNoticeDismissed] = useState(false);
   const [pdfStatus, setPdfStatus] = useState<PdfStatus>({ state: "idle" });
@@ -58,70 +64,21 @@ export default function CreatePage() {
   const pdfJob = useRef(0);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // The job this tab is waiting for; survives a reload (sessionStorage).
+  const pending = usePendingJob();
+  const loading = starting || pending !== null;
+
   // Back from Canva's consent screen: show the research the user was on.
   const canvaReturn = useCanvaReturn();
   const researches = useResearches();
   const resumed =
-    !response && canvaReturn.resumeId
+    !response && !loading && canvaReturn.resumeId
       ? (researches?.find((item) => item.id === canvaReturn.resumeId) ?? null)
       : null;
   const notice = noticeDismissed ? null : canvaReturnMessage(canvaReturn);
 
   const plan: BrandPlanResponse | null = response ?? resumed;
   const current: SavedResearch | null = response ? saved : resumed;
-
-  useEffect(() => {
-    if (!loading) return;
-    const started = Date.now();
-    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
-    return () => clearInterval(timer);
-  }, [loading]);
-
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!brand.trim()) return;
-
-    if (canvaReturn.result) clearCanvaReturn();
-    setLoading(true);
-    setElapsed(0);
-    setResponse(null);
-    setSaved(null);
-    setCopied(false);
-    setPdfStatus({ state: "idle" });
-    pdfJob.current += 1;
-    try {
-      const res = await fetch("/api/brand-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brand, brief: brief.trim() || undefined, scale }),
-      });
-      const data: BrandPlanResponse | null = await res.json().catch(() => null);
-      if (res.status === 401) {
-        // Logged out or session expired: prompt to log in instead of showing an error.
-        setLoginRequired(true);
-        router.refresh();
-      } else if (!res.ok || !data?.plan) {
-        setResponse({ error: data?.error ?? "Plan generation failed. Please try again." });
-      } else {
-        setResponse(data);
-        const item = saveResearch({
-          brand: data.brand ?? brand.trim(),
-          plan: data.plan,
-          research: data.research ?? [],
-          references: data.references ?? [],
-          deck: data.deck ?? undefined,
-          scale: data.scale,
-          brief: data.brief ?? (brief.trim() || null),
-        });
-        setSaved(item);
-        void savePdf(item);
-      }
-    } catch {
-      setResponse({ error: "Could not reach the server. Please try again." });
-    } finally {
-      setLoading(false);
-    }
-  }
 
   /** Render the report as a PDF and store it in Cloudinary, linked to the saved research. */
   async function savePdf(item: SavedResearch) {
@@ -139,6 +96,113 @@ export default function CreatePage() {
     }
   }
 
+  // A one-second clock for the elapsed time while a job runs.
+  useEffect(() => {
+    if (!pending) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [pending]);
+
+  const onJobDone = useEffectEvent((job: PendingJob, data: PlanJob) => {
+    clearPendingJob(job.id);
+    const result = data.result;
+    if (!result?.plan) {
+      setResponse({ error: "Plan generation returned no plan. Please try again." });
+      return;
+    }
+    setResponse(result);
+    const item = saveResearch({
+      brand: result.brand ?? job.brand,
+      plan: result.plan,
+      research: result.research ?? [],
+      references: result.references ?? [],
+      deck: result.deck ?? undefined,
+      scale: result.scale,
+      brief: result.brief ?? (job.brief || null),
+      dossier: result.dossier ?? undefined,
+    });
+    setSaved(item);
+    void savePdf(item);
+  });
+
+  const onJobFailed = useEffectEvent((job: PendingJob, error: string, status?: number) => {
+    clearPendingJob(job.id);
+    if (status === 401) {
+      // Logged out or session expired: prompt to log in instead of showing an error.
+      setLoginRequired(true);
+      router.refresh();
+      return;
+    }
+    setResponse({ error });
+  });
+
+  // Poll the pending job every few seconds until it finishes (also after a reload).
+  useEffect(() => {
+    if (!pending) return;
+    const job = pending;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+
+    async function tick() {
+      try {
+        const data = await fetchPlanJob(job.id);
+        if (cancelled) return;
+        failures = 0;
+        if (data.status === "done") return onJobDone(job, data);
+        if (data.status === "error") {
+          return onJobFailed(job, data.error ?? "Plan generation failed. Please try again.", data.status_code ?? 502);
+        }
+        setJobState({ id: job.id, stage: data.stage, progress: data.progress });
+      } catch (err) {
+        if (cancelled) return;
+        const status = err instanceof JobRequestError ? err.status : 0;
+        if (status === 401) return onJobFailed(job, "Please log in to continue.", 401);
+        if (status === 404) {
+          return onJobFailed(job, "This plan is no longer available (the server may have restarted). Please generate it again.");
+        }
+        failures += 1;
+        if (failures >= MAX_POLL_FAILURES) {
+          return onJobFailed(job, "Lost contact with the server while the plan was generating. Please try again.");
+        }
+      }
+      timer = setTimeout(tick, POLL_INTERVAL_MS);
+    }
+
+    void tick();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pending]);
+
+  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!brand.trim() || loading) return;
+
+    if (canvaReturn.result) clearCanvaReturn();
+    setStarting(true);
+    setJobState(null);
+    setNow(0);
+    setResponse(null);
+    setSaved(null);
+    setCopied(false);
+    setPdfStatus({ state: "idle" });
+    pdfJob.current += 1;
+    try {
+      await startPlanJob({ brand: brand.trim(), brief: brief.trim(), scale });
+    } catch (err) {
+      if (err instanceof JobRequestError && err.status === 401) {
+        setLoginRequired(true);
+        router.refresh();
+      } else {
+        setResponse({ error: err instanceof Error ? err.message : "Starting the plan failed. Please try again." });
+      }
+    } finally {
+      setStarting(false);
+    }
+  }
+
   async function handleCopy() {
     if (!plan?.plan) return;
     try {
@@ -153,7 +217,12 @@ export default function CreatePage() {
 
   const references = plan?.references ?? [];
   const deck = plan?.deck;
-  const stageIndex = STAGES.reduce((found, stage, i) => (elapsed >= stage.from ? i : found), 0);
+  const live = pending && jobState?.id === pending.id ? jobState : null;
+  const currentStage = live ? stageIndex(live.stage) : -1;
+  const progressPercent = Math.round((live?.progress ?? 0) * 100);
+  const elapsed = pending && now ? Math.max(0, Math.floor((now - pending.startedAt) / 1000)) : 0;
+  const stageLabel =
+    currentStage >= 0 ? JOB_STAGES[currentStage].label : pending ? "Queued, starting shortly" : "Starting";
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 py-10 md:px-8 md:py-14">
@@ -244,7 +313,11 @@ export default function CreatePage() {
       <section aria-live="polite" aria-busy={loading} className="brutal-box min-h-40 min-w-0 p-5 md:p-6">
         <div className="mb-4 flex items-center justify-between gap-3 border-b-3 border-foreground pb-3">
           <h2 className="min-w-0 truncate font-mono text-sm font-bold uppercase">
-            {plan?.plan ? `Plan for ${plan.brand ?? brand}` : "Response"}
+            {pending
+              ? `Generating plan for ${pending.brand}`
+              : plan?.plan
+                ? `Plan for ${plan.brand ?? brand}`
+                : "Response"}
           </h2>
           {plan?.plan && !loading && (
             <button type="button" onClick={handleCopy} className="brutal-btn h-9 shrink-0 bg-accent-2 px-3 text-xs">
@@ -256,21 +329,41 @@ export default function CreatePage() {
         {loading ? (
           <div className="flex flex-col gap-3">
             <div className="flex items-baseline justify-between gap-3">
-              <p className="font-bold">{STAGES[stageIndex].label}…</p>
-              <span className="font-mono text-xs text-muted tabular-nums">{formatElapsed(elapsed)}</span>
+              <p className="font-bold">{stageLabel}…</p>
+              <span className="font-mono text-xs text-muted tabular-nums">
+                {progressPercent}% · {formatElapsed(elapsed)}
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="Plan progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={progressPercent}
+              aria-valuetext={stageLabel}
+              className="h-4 w-full border-3 border-foreground bg-background"
+            >
+              <div
+                className="h-full bg-accent transition-[width] duration-700 ease-out"
+                style={{ width: `${Math.max(progressPercent, 2)}%` }}
+              />
             </div>
             <ol className="flex flex-col gap-1 font-mono text-xs">
-              {STAGES.map((stage, i) => (
-                <li key={stage.label} className={i === stageIndex ? "font-bold" : i < stageIndex ? "" : "text-muted"}>
+              {JOB_STAGES.map((item, i) => (
+                <li
+                  key={item.stage}
+                  className={i === currentStage ? "font-bold" : i < currentStage ? "" : "text-muted"}
+                >
                   <span aria-hidden="true" className="inline-block w-5">
-                    {i < stageIndex ? "✓" : i === stageIndex ? "▶" : "·"}
+                    {i < currentStage ? "✓" : i === currentStage ? "▶" : "·"}
                   </span>
-                  {stage.label}
+                  {item.label}
                 </li>
               ))}
             </ol>
             <p className="font-mono text-xs text-muted">
-              Focused decks take under a minute; flagship decks take a couple of minutes.
+              Focused decks take about a minute; flagship decks take 3–5 minutes. It runs on the server, so
+              reloading this tab is fine.
             </p>
           </div>
         ) : response?.error ? (
@@ -299,6 +392,7 @@ export default function CreatePage() {
               </p>
             )}
 
+            {plan.dossier && <DossierPanel dossier={plan.dossier} />}
             <ResearchSources research={plan.research ?? []} />
             <p className="font-mono text-xs text-muted">
               Saved to Your researches.{" "}
