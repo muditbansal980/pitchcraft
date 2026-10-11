@@ -217,6 +217,6 @@ Why: user feedback 2026-10-11. Deck content is thin (compact context: 800-char s
 - [x] Step 0 — branch, contracts C4/C8/C9, settings, `trafilatura`, stubs
 - [ ] Agent D — deep research + service playbooks
 - [ ] Agent A — dossier-grounded, per-bucket generation + services woven in
-- [ ] Agent B — renderer for execution/sample posts/services/bullets/footnotes
+- [x] Agent B — renderer for execution/sample posts/services/bullets/footnotes. **Accepted** (coordinator reviewed v3_render_sheet: split concept/run pages, Powered-by chips, post cards, sourced bullets, 5–6 col tables; regression pixel-diff only tables changed). Coordinator tweaks: post cards show the brand name instead of a guessed @handle; table cap raised 6 → 8 columns.
 - [x] Agent C — plan jobs + progress UI + dossier panel. **Accepted** (coordinator re-ran eslint, tsc, 8/8 job tests). Headless-browser run: real stage polling, reload mid-job resumes, dossier panel, Powered-by tiles. Waits on A's `on_stage` for live stages (falls back without it). Jobs are per-process (single uvicorn worker).
 - [ ] Integration (v2 vs v3 comparison) + PR

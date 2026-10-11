@@ -137,6 +137,12 @@ class Ctx:
     prev_hero: bool = False  # the previous slide used the hero image
     used_hero: bool = False
     strong_decor: bool = False  # cover/divider/fin show the full decor pattern
+    extra: float = 0.0  # extra bottom space reserved for the sources footnote
+    footnotes: list[str] = field(default_factory=list)
+
+    @property
+    def foot(self) -> float:
+        return FOOT + self.extra
 
 
 # --- shared pieces ----------------------------------------------------------
@@ -248,6 +254,26 @@ def _footer(slide, ctx: Ctx) -> None:
          color=t.muted, bold=True, tracking=1.5)
     text(slide, W - MX - 1.5, H - 0.46, 1.5, 0.22, f"{ctx.index:02d}", font=lk.bf, size=8,
          color=t.muted, bold=True, align="right", tracking=1.5)
+
+
+FOOTNOTE_EXTRA = 0.3
+
+
+def _footnote(slide, ctx: Ctx, sources: list[str]) -> None:
+    """One muted line "Sources: a · b · c" above the footer; the full list also goes in the notes."""
+    items = [" ".join(x.split()) for x in sources or [] if x and x.strip()]
+    if not items:
+        return
+    lk, t = ctx.look, ctx.look.t
+    line = "Sources: " + " · ".join(items)
+    size = 8.0
+    fitted = clip_lines(line, CONTENT_W, size, lk.bf, 1)
+    if fitted != line:
+        size = 7.5
+        fitted = clip_lines(line, CONTENT_W, size, lk.bf, 1)
+    text(slide, MX, H - 0.76, CONTENT_W, 0.22, fitted, font=lk.bf, size=size, color=t.muted, italic=True,
+         spacing=1.0)
+    ctx.footnotes.extend(items)
 
 
 def _headline_runs(title: str, lk: Look) -> list[list[Run]]:
@@ -509,18 +535,55 @@ def build_statement(slide, s: StatementSlide, ctx: Ctx) -> None:
     if not _hero_background(slide, ctx, overlay=0.8, optional=True):
         _background(slide, ctx)
     hw = 11.3
-    hf = _head_fit(ctx, s.title, hw, 2.4, 76, 34, 2)
-    body_f = fit_text(s.body, 9.6, 2.3, lk.bf, max_pt=22, min_pt=13, spacing=1.32) if s.body else None
-    total = hf.height + (0.8 if s.strip else 0) + ((body_f.height + 0.75) if body_f else 0)
-    y = max(0.7, (H - total) / 2 - 0.2)
+    bullets = [b for b in s.bullets if b and b.strip()]
+    hf = _head_fit(ctx, s.title, hw, 2.0 if bullets else 2.4, 68 if bullets else 76, 30 if bullets else 34, 2)
+    body_room = 1.4 if bullets else 2.3
+    body_f = fit_text(s.body, 9.6, body_room, lk.bf, max_pt=20 if bullets else 22, min_pt=13, spacing=1.32) \
+        if s.body else None
+    bw = 8.8
+    bsize, b_h = 0.0, 0.0
+    if bullets:
+        bsize = 17.0
+        while True:
+            b_h = sum(wrap_count(b, bw - 0.4, bsize, lk.bf) * bsize * 1.3 / 72 + 0.12 for b in bullets)
+            if b_h <= 2.3 or bsize <= 11:
+                break
+            bsize -= 0.5
+    total = hf.height + (0.8 if s.strip else 0) + ((body_f.height + (0.6 if bullets else 0.75)) if body_f else 0) + \
+        ((b_h + 0.35) if bullets else 0)
+    y = max(0.55 if bullets else 0.7, (H - ctx.extra - total) / 2 - 0.2)
     bottom = _headline(slide, ctx, s.title, (W - hw) / 2, y, hw, hf.height + 0.08, max_pt=hf.size,
                        min_pt=hf.size, align="center")
     if s.strip:
         bottom = _strip(slide, ctx, s.strip, (W - 10.6) / 2, bottom + 0.2, 10.6, align="center", size=16)
     if s.body:
-        _body(slide, ctx, s.body, (W - 9.6) / 2, bottom + 0.45, 9.6, H - bottom - 1.2, max_pt=22, min_pt=13,
-              align="center", lead=True)
+        room = (body_f.height + 0.1) if bullets and body_f else H - bottom - 1.2 - ctx.extra
+        bottom = _body(slide, ctx, s.body, (W - 9.6) / 2, bottom + 0.45, 9.6, room,
+                       max_pt=20 if bullets else 22, min_pt=13, align="center", lead=True)
+    if bullets:
+        _statement_bullets(slide, ctx, bullets, (W - bw) / 2, bottom + 0.35, bw, bsize,
+                           H - ctx.foot - (bottom + 0.35))
     _footer(slide, ctx)
+
+
+def _statement_bullets(slide, ctx: Ctx, bullets: list[str], x: float, y: float, w: float, size: float,
+                       room: float) -> None:
+    """Left-aligned bullet block with accent markers, centred as a block under the statement."""
+    lk, t = ctx.look, ctx.look.t
+    while size > 10 and sum(wrap_count(b, w - 0.4, size, lk.bf) * size * 1.3 / 72 + 0.12 for b in bullets) > room:
+        size -= 0.5  # fit every bullet in the space the headline left
+    lh = size * 1.3 / 72
+    widest = max(min(w - 0.4, measure(b, size, lk.bf)) for b in bullets)
+    bx = x + (w - (widest + 0.4)) / 2  # centre the block, keep lines left-aligned
+    end = y + room
+    for b in bullets:
+        b = clip_to_box(b, w - 0.4, max(lh, end - y), size, lk.bf, spacing=1.3)
+        bh = wrap_count(b, w - 0.4, size, lk.bf) * lh
+        if y + min(bh, lh) > end + 1e-6:
+            break
+        box(slide, bx, y + lh / 2 - 0.05, 0.1, 0.1, t.accent, shape=MSO_SHAPE.DIAMOND)
+        text(slide, bx + 0.32, y, w - 0.4, bh + 0.05, b, font=lk.bf, size=size, color=t.text, spacing=1.3)
+        y += bh + 0.12
 
 
 def build_from_to(slide, s: FromToSlide, ctx: Ctx) -> None:
@@ -557,7 +620,7 @@ def build_formula(slide, s: FormulaSlide, ctx: Ctx) -> None:
     op_w = 0.7
     cw = (CONTENT_W - op_w * (n - 1)) / n
     cy = max(y + 0.15, 2.3)
-    ch = min(3.9, H - cy - 1.0)
+    ch = min(3.9, H - cy - 1.0 - ctx.extra)
     inner = cw - 0.6
     label_fits = [_head_fit(ctx, c.label, inner, 1.0, 30, 16, 2) for c in cards]
     lsize = min(f.size for f in label_fits)
@@ -566,7 +629,7 @@ def build_formula(slide, s: FormulaSlide, ctx: Ctx) -> None:
                 for c in cards)
     # Cards hug their content and the row sits centred in the space under the title.
     b_h = max(wrap_count(c.text, inner, bsize, lk.bf) for c in cards) * bsize * 1.32 / 72
-    area = H - FOOT - cy
+    area = H - ctx.foot - cy
     ch = min(ch, max(2.4, l_h + b_h + 1.15))
     cy += max(0.0, (area - ch) / 2 - 0.2)
     for i, c in enumerate(cards):
@@ -594,7 +657,7 @@ def build_card_grid(slide, s: CardGridSlide, ctx: Ctx) -> None:
     gap = 0.28
     cw = (CONTENT_W - gap * (n - 1)) / n
     cy = max(y, 2.25)
-    ch = H - cy - FOOT
+    ch = H - cy - ctx.foot
     pad = 0.22
     inner = cw - 2 * pad
     # Image areas only when at least one card has a real image; otherwise text cards, not empty boxes.
@@ -671,68 +734,289 @@ def _quoted(value: str) -> str:
     return f"“{core}”" if core else ""
 
 
-def build_idea(slide, s: IdeaSlide, ctx: Ctx) -> None:
-    """Labelled chips on the left (PC02 "KYP" slide), accent-framed visual on the right."""
-    lk, t = ctx.look, ctx.look.t
-    _background(slide, ctx)
-    has_visual = s.visual is not None
-    col_w = 7.7 if has_visual else CONTENT_W
-    title_bottom = _headline(slide, ctx, s.title, MX, 0.5, col_w + (0.6 if has_visual else 0), 1.25,
-                             max_pt=46, min_pt=26, max_lines=2)
-    # (label, text, italic, stacked): long fields sit under their tab, short ones beside it.
+IDEA_TAB_SIZE = 14
+IDEA_TAB_H = 0.36
+IDEA_GAP = 0.2
+
+
+def _idea_sections(s: IdeaSlide, *, extras: bool) -> list[tuple[str, str, bool, bool]]:
+    """(label, text, italic, stacked). ``extras`` adds the v3 execution steps / sample posts inline."""
     sections = [
         ("Concept Note", s.concept_note, False, True),
         ("Hook", _quoted(s.hook), True, False),
         ("Format", s.format, False, False),
         ("Creator", s.creator, False, False),
-        ("Scalability", s.scalability, True, True),
     ]
-    sections = [sec for sec in sections if sec[1] and sec[1].strip()]
-    tab_size = 14
-    tab_h = 0.36
-    inline_tab_w = max((measure(lbl + ":", tab_size, lk.bf, bold=True) for lbl, _, _, st in sections if not st),
-                       default=1.2) + 0.55
-    top = max(1.6, title_bottom + 0.3)
-    bottom = H - FOOT
-    gap = 0.2
+    if extras and s.execution:
+        steps = [x for x in s.execution if x and x.strip()]
+        sections.append(("How we run it", "\n".join(f"{i}. {x}" for i, x in enumerate(steps, 1)), False, True))
+    if extras and s.sample_posts:
+        posts = [x for x in s.sample_posts if x and x.strip()]
+        sections.append(("Sample posts", "\n".join(f"“{x.strip(chr(34))}”" for x in posts), True, True))
+    sections.append(("Scalability", s.scalability, True, True))
+    return [sec for sec in sections if sec[1] and sec[1].strip()]
 
-    def layout_height(size: float) -> float:
-        lh = size * 1.3 / 72
-        total = 0.0
-        for _, body, _, stacked in sections:
-            if stacked:
-                total += tab_h + 0.1 + wrap_count(body, col_w, size, lk.bf) * lh
-            else:
-                total += max(tab_h, wrap_count(body, col_w - inline_tab_w - 0.15, size, lk.bf) * lh)
-        return total + gap * (len(sections) - 1)
 
-    size = 16.0
-    while size > 10 and layout_height(size) > bottom - top:
-        size -= 0.5
+def _idea_layout_height(sections, col_w: float, size: float, font: str, inline_tab_w: float) -> float:
     lh = size * 1.3 / 72
-    y = top
-    for label, body, it, stacked in sections:
-        tw = (max(2.2, measure(label + ":", tab_size, lk.bf, bold=True) + 0.9)) if stacked else inline_tab_w
-        tab = box(slide, MX, y, tw, tab_h, t.accent, shape=MSO_SHAPE.PARALLELOGRAM, adj=0.15)
+    total = 0.0
+    for _, body, _, stacked in sections:
         if stacked:
-            set_gradient(tab, [(0, t.accent, 1), (0.62, t.accent, 1), (1, t.accent, 0.0)], 0)
-        text(slide, MX + 0.17, y, tw - 0.25, tab_h, label + ":", font=lk.bf, size=tab_size, color=lk.on_accent,
-             bold=True, anchor="middle", spacing=1.0)
-        if stacked:
-            y += tab_h + 0.1
-            bh = wrap_count(body, col_w, size, lk.bf) * lh
-            text(slide, MX, y, col_w, bh + 0.05, body, font=lk.bf, size=size, color=t.text, italic=it, spacing=1.3)
-            y += bh + gap
+            total += IDEA_TAB_H + 0.1 + wrap_count(body, col_w, size, font) * lh
         else:
-            bw = col_w - inline_tab_w - 0.15
-            bh = wrap_count(body, bw, size, lk.bf) * lh
-            ty = y + max(0.0, (tab_h - min(bh, lh)) / 2)
-            text(slide, MX + inline_tab_w + 0.15, ty, bw, bh + 0.05, body, font=lk.bf, size=size, color=t.text,
-                 italic=it, spacing=1.3)
-            y += max(tab_h, bh) + gap
+            total += max(IDEA_TAB_H, wrap_count(body, col_w - inline_tab_w - 0.15, size, font) * lh)
+    return total + IDEA_GAP * (len(sections) - 1)
+
+
+def _inline_tab_w(sections, font: str) -> float:
+    return max((measure(lbl + ":", IDEA_TAB_SIZE, font, bold=True) for lbl, _, _, st in sections if not st),
+               default=1.2) + 0.55
+
+
+def _services_band_h(s: IdeaSlide, width: float, font: str) -> float:
+    services = [x for x in s.services if x and x.strip()]
+    if not services:
+        return 0.0
+    chips = _pill_rows(services, width - 1.75, font, 11)
+    mech = wrap_count(s.service_mechanics, width, 10.5, font) * 10.5 * 1.3 / 72 if s.service_mechanics else 0
+    return max(0.36, chips) + (mech + 0.08 if mech else 0) + 0.25
+
+
+def _has_v3(s: IdeaSlide) -> bool:
+    return bool(s.execution or s.sample_posts or s.services or s.service_mechanics)
+
+
+def idea_fits_single(s: IdeaSlide, foot: float = FOOT) -> bool:
+    """True when concept + execution + powered-by fit on one slide at >= 11pt (sample posts always split)."""
+    if not _has_v3(s):
+        return True
+    if any(x and x.strip() for x in s.sample_posts):
+        return False
+    from app.services.deck_render_kit import _FONTS  # noqa: F401 - metrics are loaded with the kit
+
+    font = "Montserrat"  # a mid-width stand-in; the real check repeats at render time
+    col_w = 7.7 if s.visual is not None else CONTENT_W
+    sections = _idea_sections(s, extras=True)
+    band = _services_band_h(s, col_w, font)
+    avail = H - foot - band - 1.75
+    return _idea_layout_height(sections, col_w, 11.0, font, _inline_tab_w(sections, font)) <= avail
+
+
+def build_idea(slide, s: IdeaSlide, ctx: Ctx) -> None:
+    """Labelled chips on the left (PC02 "KYP" slide), accent-framed visual on the right.
+
+    v3 fields that fit (execution steps, powered-by services) are drawn on the same slide; a
+    long idea is split into two pages by ``expand_slide`` before it gets here."""
+    lk = ctx.look
+    _background(slide, ctx)
+    has_visual = s.visual is not None
+    col_w = 7.7 if has_visual else CONTENT_W
+    title_bottom = _headline(slide, ctx, s.title, MX, 0.5, col_w + (0.6 if has_visual else 0), 1.25,
+                             max_pt=46, min_pt=26, max_lines=2)
+    sections = _idea_sections(s, extras=True)
+    inline_tab_w = _inline_tab_w(sections, lk.bf)
+    band = _services_band_h(s, col_w, lk.bf)
+    top = max(1.6, title_bottom + 0.3)
+    bottom = H - ctx.foot - band
+    size = 16.0
+    while size > 10 and _idea_layout_height(sections, col_w, size, lk.bf, inline_tab_w) > bottom - top:
+        size -= 0.5
+    _idea_sections_draw(slide, ctx, sections, MX, top, col_w, size, inline_tab_w, bottom)
+    if band:
+        _powered_by(slide, ctx, s, MX, H - ctx.foot - band + 0.1, col_w)
     if has_visual:
         _visual(slide, ctx, s.visual, 9.0, 0.95, 3.6, 5.6, frame=3.0)
     _footer(slide, ctx)
+
+
+def _tab(slide, ctx: Ctx, label: str, x: float, y: float, *, stacked: bool, width: float | None = None) -> float:
+    lk, t = ctx.look, ctx.look.t
+    tw = width or max(2.2, measure(label + ":", IDEA_TAB_SIZE, lk.bf, bold=True) + 0.9)
+    tab = box(slide, x, y, tw, IDEA_TAB_H, t.accent, shape=MSO_SHAPE.PARALLELOGRAM, adj=0.15)
+    if stacked:
+        set_gradient(tab, [(0, t.accent, 1), (0.62, t.accent, 1), (1, t.accent, 0.0)], 0)
+    text(slide, x + 0.17, y, tw - 0.25, IDEA_TAB_H, label + ":", font=lk.bf, size=IDEA_TAB_SIZE,
+         color=lk.on_accent, bold=True, anchor="middle", spacing=1.0)
+    return tw
+
+
+def _idea_sections_draw(slide, ctx: Ctx, sections, x: float, top: float, col_w: float, size: float,
+                        inline_tab_w: float, bottom: float) -> float:
+    lk, t = ctx.look, ctx.look.t
+    lh = size * 1.3 / 72
+    y = top
+    for label, body, it, stacked in sections:
+        if stacked:
+            _tab(slide, ctx, label, x, y, stacked=True)
+            y += IDEA_TAB_H + 0.1
+            body = clip_to_box(body, col_w, max(lh, bottom - y), size, lk.bf, spacing=1.3)
+            bh = wrap_count(body, col_w, size, lk.bf) * lh
+            text(slide, x, y, col_w, bh + 0.05, body, font=lk.bf, size=size, color=t.text, italic=it, spacing=1.3)
+            y += bh + IDEA_GAP
+        else:
+            _tab(slide, ctx, label, x, y, stacked=False, width=inline_tab_w)
+            bw = col_w - inline_tab_w - 0.15
+            bh = wrap_count(body, bw, size, lk.bf) * lh
+            ty = y + max(0.0, (IDEA_TAB_H - min(bh, lh)) / 2)
+            text(slide, x + inline_tab_w + 0.15, ty, bw, bh + 0.05, body, font=lk.bf, size=size, color=t.text,
+                 italic=it, spacing=1.3)
+            y += max(IDEA_TAB_H, bh) + IDEA_GAP
+    return y
+
+
+def _powered_by(slide, ctx: Ctx, s: IdeaSlide, x: float, y: float, width: float) -> None:
+    """ "Powered by" label + filled service chips, with the service mechanics as a small line under them."""
+    lk, t = ctx.look, ctx.look.t
+    services = [v for v in s.services if v and v.strip()]
+    box(slide, x, y - 0.12, width, 0.012, lk.line)
+    text(slide, x, y + 0.02, 1.6, 0.32, "POWERED BY", font=lk.bf, size=10, color=t.accent, bold=True,
+         tracking=1.5, anchor="middle")
+    used = _pills(slide, ctx, services, x + 1.75, y, width - 1.75, size=11, fill=t.accent, color=lk.on_accent)
+    if s.service_mechanics:
+        my = y + max(0.36, used) + 0.08
+        mech, mf = fit_or_clip(s.service_mechanics, width, max(0.2, H - ctx.foot - my - 0.02), lk.bf,
+                               max_pt=10.5, min_pt=8.5, spacing=1.3)
+        text(slide, x, my, width, mf.height + 0.05, mech, font=lk.bf, size=mf.size, color=t.muted, italic=True,
+             spacing=1.3)
+
+
+@dataclass
+class IdeaRunPage:
+    """Second page of a split idea: execution, sample posts, powered-by, scalability."""
+
+    idea: IdeaSlide
+    layout: str = "idea"
+
+    @property
+    def title(self) -> str:
+        return self.idea.title
+
+    @property
+    def notes(self) -> str:
+        return ""
+
+    @property
+    def sources(self) -> list[str]:
+        return list(self.idea.sources)
+
+
+def _with_suffix(title: str, suffix: str) -> str:
+    title = (title or "").strip().rstrip(":")
+    return f"{title}: {suffix}" if ":" not in title else f"{title} ({suffix})"
+
+
+def expand_slide(s):
+    """A slide becomes one page, or two for an idea whose v3 content does not fit one slide."""
+    if not isinstance(s, IdeaSlide) or not _has_v3(s):
+        return [s]
+    foot = FOOT + (FOOTNOTE_EXTRA if any(x and x.strip() for x in s.sources) else 0.0)
+    if idea_fits_single(s, foot):
+        return [s]
+    concept = s.model_copy(update={
+        "title": _with_suffix(s.title, "the concept"), "execution": [], "sample_posts": [], "services": [],
+        "service_mechanics": "", "scalability": "",
+    })
+    return [concept, IdeaRunPage(idea=s)]
+
+
+def build_idea_run(slide, page: IdeaRunPage, ctx: Ctx) -> None:
+    lk, t = ctx.look, ctx.look.t
+    s = page.idea
+    _background(slide, ctx)
+    title_bottom = _headline(slide, ctx, _with_suffix(s.title, "how we run it"), MX, 0.5, CONTENT_W, 1.25,
+                             max_pt=44, min_pt=26, max_lines=2)
+    top = max(1.6, title_bottom + 0.3)
+    band = _services_band_h(s, CONTENT_W, lk.bf)
+    bottom = H - ctx.foot - band
+    steps = [x for x in s.execution if x and x.strip()]
+    posts = [x for x in s.sample_posts if x and x.strip()]
+    gap = 0.5
+    left_w = 6.55 if posts else CONTENT_W
+    right_x, right_w = MX + left_w + gap, CONTENT_W - left_w - gap
+    num_d = 0.38
+    scal_w = measure("Scalability:", IDEA_TAB_SIZE, lk.bf, bold=True) + 0.55
+
+    # Left: numbered execution steps (+ scalability).
+    def left_h(size: float) -> float:
+        lh = size * 1.3 / 72
+        h = (IDEA_TAB_H + 0.14) if steps else 0
+        h += sum(max(num_d, wrap_count(x, left_w - num_d - 0.2, size, lk.bf) * lh) + 0.1 for x in steps)
+        if s.scalability:
+            h += 0.12 + max(IDEA_TAB_H, wrap_count(s.scalability, left_w - scal_w - 0.15, size, lk.bf) * lh)
+        return h
+
+    size = 16.0
+    while size > 10 and left_h(size) > bottom - top:
+        size -= 0.5  # noqa: E501
+    lh = size * 1.3 / 72
+    y = top
+    if steps:
+        _tab(slide, ctx, "Execution", MX, y, stacked=True)
+        y += IDEA_TAB_H + 0.14
+        for i, step in enumerate(steps, 1):
+            step = clip_to_box(step, left_w - num_d - 0.2, max(lh, bottom - y), size, lk.bf, spacing=1.3)
+            sh = wrap_count(step, left_w - num_d - 0.2, size, lk.bf) * lh
+            box(slide, MX, y + max(0.0, (min(sh, lh) - num_d) / 2), num_d, num_d, t.accent, shape=MSO_SHAPE.OVAL)
+            text(slide, MX, y + max(0.0, (min(sh, lh) - num_d) / 2), num_d, num_d, str(i), font=lk.hf, size=14,
+                 color=lk.on_accent, bold=lk.head_bold, align="center", anchor="middle", spacing=1.0)
+            text(slide, MX + num_d + 0.2, y, left_w - num_d - 0.2, sh + 0.05, step, font=lk.bf, size=size,
+                 color=t.text, spacing=1.3)
+            y += max(num_d, sh) + 0.1
+    if s.scalability:
+        y += 0.12
+        _tab(slide, ctx, "Scalability", MX, y, stacked=False, width=scal_w)
+        sw = left_w - scal_w - 0.15
+        sc = clip_to_box(s.scalability, sw, max(lh, bottom - y), size, lk.bf, spacing=1.3)
+        sh = wrap_count(sc, sw, size, lk.bf) * lh
+        text(slide, MX + scal_w + 0.15, y + max(0.0, (IDEA_TAB_H - min(sh, lh)) / 2), sw, sh + 0.05, sc,
+             font=lk.bf, size=size, color=t.text, italic=True, spacing=1.3)
+
+    # Right: sample posts as post cards.
+    if posts:
+        _post_cards(slide, ctx, posts, right_x, top, right_w, bottom - top)
+    if band:
+        _powered_by(slide, ctx, s, MX, H - ctx.foot - band + 0.1, CONTENT_W)
+    _footer(slide, ctx)
+
+
+def _post_cards(slide, ctx: Ctx, posts: list[str], x: float, y: float, w: float, h: float) -> None:
+    """Instagram-style caption cards: avatar, handle, caption bubble."""
+    lk, t = ctx.look, ctx.look.t
+    _tab(slide, ctx, "Sample posts", x, y, stacked=True)
+    y += IDEA_TAB_H + 0.14
+    h -= IDEA_TAB_H + 0.14
+    # Brand name, not a guessed @handle: an invented handle would look like a real (wrong) account.
+    handle = (ctx.deck.brand or "Brand").strip()[:40]
+    tight = len(posts) >= 3 and h < 3.6
+    pad, head = (0.1, 0.26) if tight else (0.16, 0.34)
+    gap = 0.1 if tight else 0.14
+    inner = w - 2 * pad
+
+    def need(size: float) -> float:
+        lh = size * 1.3 / 72
+        return sum(head + 0.06 + wrap_count(p, inner, size, lk.bf) * lh + 2 * pad for p in posts) + gap * (len(posts) - 1)
+
+    size = 13.0
+    while size > 8.5 and need(size) > h:
+        size -= 0.5
+    lh = size * 1.3 / 72
+    budget = (h - gap * (len(posts) - 1)) / len(posts)
+    for i, post in enumerate(posts, 1):
+        cap = clip_to_box(post.strip().strip('"“”'), inner, max(lh, budget - head - 0.06 - 2 * pad), size, lk.bf,
+                          spacing=1.3)
+        ch = head + 0.06 + wrap_count(cap, inner, size, lk.bf) * lh + 2 * pad
+        box(slide, x, y, w, ch, t.surface, line=lk.line, line_w=1.0, radius=0.12)
+        box(slide, x + pad, y + pad, head - 0.04, head - 0.04, t.accent, shape=MSO_SHAPE.OVAL)
+        text(slide, x + pad + head + 0.06, y + pad - 0.02, inner - 1.4, head, handle, font=lk.bf, size=10, color=t.text,
+             bold=True, anchor="middle", spacing=1.0, wrap=False)
+        text(slide, x + w - pad - 1.2, y + pad - 0.02, 1.2, head, f"POST {i:02d}", font=lk.bf, size=8.5,
+             color=t.accent, bold=True, align="right", anchor="middle", tracking=1.2, spacing=1.0)
+        text(slide, x + pad, y + pad + head + 0.06, inner, ch - head - 2 * pad, cap, font=lk.bf, size=size,
+             color=t.text, spacing=1.3)
+        y += ch + gap
+
+
+PAGE_BUILDERS = {IdeaRunPage: build_idea_run}
 
 
 def _grid(n: int, x: float, y: float, w: float, h: float, gap: float = 0.3,
@@ -753,7 +1037,7 @@ def build_samples(slide, s: SamplesSlide, ctx: Ctx) -> None:
     vis = list(s.visuals)
     n = len(vis)
     area_y = max(y, 2.15)
-    area_h = H - area_y - 1.0
+    area_h = H - area_y - 1.0 - ctx.extra
     gap = 0.35
     cw = (CONTENT_W - gap * (n - 1)) / n
     if n == 1:
@@ -776,11 +1060,11 @@ def build_ref(slide, s: RefSlide, ctx: Ctx) -> None:
         left_w = 4.4
         bottom = _headline(slide, ctx, s.title, MX, 0.65, left_w, 2.5, max_pt=46, min_pt=24, max_lines=4)
         box(slide, MX, bottom + 0.25, 0.6, 0.06, t.accent)
-        _body(slide, ctx, s.why, MX, bottom + 0.55, left_w, H - bottom - 0.55 - FOOT - 0.2, max_pt=17, min_pt=11)
-        gx, gy, gw, gh = MX + left_w + 0.55, 0.65, CONTENT_W - left_w - 0.55, H - 0.65 - FOOT - 0.15
+        _body(slide, ctx, s.why, MX, bottom + 0.55, left_w, H - bottom - 0.55 - ctx.foot - 0.2, max_pt=17, min_pt=11)
+        gx, gy, gw, gh = MX + left_w + 0.55, 0.65, CONTENT_W - left_w - 0.55, H - 0.65 - ctx.foot - 0.15
     else:
         y = _title_block(slide, ctx, s.title, "", max_pt=44)
-        gx, gy, gw, gh = MX, y, CONTENT_W, H - y - FOOT - 0.15
+        gx, gy, gw, gh = MX, y, CONTENT_W, H - y - ctx.foot - 0.15
     cols = 2 if len(vis) >= 3 and gw < 8.5 else None  # beside the "why" text, 2 x 2 keeps images large
     for v, (x, y, w, h) in zip(vis, _grid(len(vis), gx, gy, gw, gh, cols=cols), strict=False):
         _visual(slide, ctx, v, x, y, w, h - 0.3, mode="contain", frame=1.5, tag="Ref")
@@ -797,7 +1081,7 @@ def build_two_column(slide, s: TwoColumnSlide, ctx: Ctx) -> None:
     hsize = min(_head_fit(ctx, c.heading, cw, 0.9, 30, 18, 2).size for c in cols)
     h_h = max(wrap_count(c.heading, cw, hsize, lk.hf, bold=lk.head_bold, upper=lk.upper) for c in cols) * hsize / 72
     list_y = y + h_h + 0.5
-    avail = H - list_y - FOOT - 0.1
+    avail = H - list_y - ctx.foot - 0.1
     bullet_w = cw - 0.4
 
     def need(size: float) -> float:
@@ -815,7 +1099,7 @@ def build_two_column(slide, s: TwoColumnSlide, ctx: Ctx) -> None:
             budget = max(1, int((avail - len(bl) * size * 0.5 / 72) / lh / max(1, len(bl))))
             trimmed.append(c.model_copy(update={"bullets": [clip_lines(b, bullet_w, size, lk.bf, budget) for b in bl]}))
         cols = tuple(trimmed)
-    box(slide, MX + cw + gap / 2, y + 0.05, 0.015, H - y - FOOT - 0.1, lk.line)
+    box(slide, MX + cw + gap / 2, y + 0.05, 0.015, H - y - ctx.foot - 0.1, lk.line)
     for i, col in enumerate(cols):
         x = MX + i * (cw + gap)
         text(slide, x, y, cw, h_h + 0.05, col.heading, font=lk.hf, size=hsize, color=t.accent, bold=lk.head_bold,
@@ -840,14 +1124,11 @@ def build_table(slide, s: TableSlide, ctx: Ctx) -> None:
     rows = [list(r[:ncols]) + [""] * (ncols - len(r[:ncols])) for r in s.rows if any(c for c in r)]
     if not rows:
         rows = [[""] * ncols]
-    # Column widths follow content length (clamped).
-    lens = [max([len(headers[c]) * 1.3] + [len(r[c]) for r in rows]) + 6 for c in range(ncols)]
-    shares = [min(0.55, max(0.1, ln / sum(lens))) for ln in lens]
-    widths = [CONTENT_W * sh / sum(shares) for sh in shares]
+    widths = _column_widths(headers, rows, lk.bf, CONTENT_W)
     top = max(y, 2.1)
-    avail = H - top - FOOT - 0.15
-    pad_x, pad_y = 0.14, 0.09
-    hsize = 12.0
+    avail = H - top - ctx.foot - 0.15
+    pad_x, pad_y = (0.14, 0.09) if ncols <= 5 else (0.1, 0.07)
+    hsize = 12.0 if ncols <= 4 else (11.0 if ncols <= 6 else 10.0)
 
     def heights(size: float) -> tuple[float, list[float]]:
         head = max(wrap_count(h, w - 2 * pad_x, hsize, lk.bf, bold=True, upper=True)
@@ -856,9 +1137,9 @@ def build_table(slide, s: TableSlide, ctx: Ctx) -> None:
                          enumerate(zip(r, widths, strict=True)))) * size * 1.25 / 72 + 2 * pad_y for r in rows]
         return head, body
 
-    size = 16.0
+    size = 16.0 if ncols <= 4 else (14.0 if ncols <= 6 else 12.0)
     head_h, row_hs = heights(size)
-    while size > 9 and head_h + sum(row_hs) > avail:
+    while size > 8.5 and head_h + sum(row_hs) > avail:
         size -= 0.5
         head_h, row_hs = heights(size)
     if head_h + sum(row_hs) > avail:  # still too tall at 9pt: clip every cell to an equal line budget
@@ -904,6 +1185,41 @@ def build_table(slide, s: TableSlide, ctx: Ctx) -> None:
     _footer(slide, ctx)
 
 
+def _column_widths(headers: list[str], rows: list[list[str]], font: str, total_w: float) -> list[float]:
+    """Width per column: never narrower than its longest word (so words don't break), and the rest
+    shared by how much text each column carries (long "what we'll do" columns get room, short
+    "phase"/"KPI" columns stay compact)."""
+    from app.services.deck_render_kit import measure as _m
+
+    ncols = len(headers)
+    pad = 0.24 if ncols <= 5 else 0.2
+    size = 12.0 if ncols <= 5 else 10.5
+    floors, weights = [], []
+    for c in range(ncols):
+        cells = [r[c] for r in rows if c < len(r) and r[c]]
+        words = [w for v in [headers[c], *cells] for w in v.split()] or ["x"]
+        longest = max(_m(w, size, font, bold=True) for w in words)
+        floors.append(min(longest + pad, total_w / ncols * 1.6))
+        lens = [len(v) for v in cells] or [len(headers[c])]
+        avg, mx = sum(lens) / len(lens), max(lens)
+        weights.append(max(6.0, 0.55 * avg + 0.45 * mx, len(headers[c]) * 0.8))
+    floors = [max(f, 0.75) for f in floors]
+    if sum(floors) > total_w:  # extreme: scale floors down proportionally
+        k = total_w / sum(floors)
+        return [f * k for f in floors]
+    spare = total_w - sum(floors)
+    widths = [f + spare * w / sum(weights) for f, w in zip(floors, weights, strict=True)]
+    # Cap any single column at 55% so short columns are never squeezed to nothing.
+    cap = total_w * 0.55
+    over = sum(max(0, w - cap) for w in widths)
+    if over:
+        widths = [min(w, cap) for w in widths]
+        room = [i for i, w in enumerate(widths) if w < cap]
+        for i in room:
+            widths[i] += over / len(room)
+    return widths
+
+
 def _cell_text(cell, value: str, font: str, size: float, color: str, *, bold: bool = False,
                upper: bool = False) -> None:
     tf = cell.text_frame
@@ -924,7 +1240,7 @@ def build_chips(slide, s: ChipsSlide, ctx: Ctx) -> None:
     y = _title_block(slide, ctx, s.title, s.strip, max_pt=46)
     groups = list(s.groups)
     top = max(y, 2.15)
-    cells = _grid(len(groups), MX, top, CONTENT_W, H - top - FOOT, gap=0.28)
+    cells = _grid(len(groups), MX, top, CONTENT_W, H - top - ctx.foot, gap=0.28)
     if not cells:
         _footer(slide, ctx)
         return
@@ -966,7 +1282,7 @@ def build_timeline(slide, s: TimelineSlide, ctx: Ctx) -> None:
     bar_h = 0.8
     pts_y = bar_y + bar_h + 0.35
     col_w = pw - 0.45
-    room = H - pts_y - FOOT
+    room = H - pts_y - ctx.foot
 
     def need(size: float) -> float:
         return max((sum(wrap_count(p, col_w - 0.3, size, lk.bf) * size * 1.3 / 72 + size * 0.45 / 72
@@ -1026,7 +1342,7 @@ def build_fin(slide, s: FinSlide, ctx: Ctx) -> None:
     else:
         sub_bottom = y + f.height
     brand = (ctx.deck.brand or "").upper()[:60]
-    logo_y = min(H - 1.0, max(H - 1.45, sub_bottom + 0.25))
+    logo_y = min(H - 1.0 - ctx.extra, max(H - 1.45 - ctx.extra, sub_bottom + 0.25))
     if _logo(slide, ctx, MX, logo_y, CONTENT_W, min(0.6, H - 0.35 - logo_y), align="center") is None and brand:
         text(slide, MX, H - 1.05, CONTENT_W, 0.3, brand, font=lk.bf, size=11, color=t.muted, bold=True,
              align="center", tracking=3)
@@ -1043,7 +1359,7 @@ def build_fallback(slide, s, ctx: Ctx) -> None:
         val = getattr(s, name, None)
         if isinstance(val, str) and val.strip():
             parts.append(val.strip())
-    _body(slide, ctx, "\n".join(parts)[:900], MX, y, CONTENT_W, H - y - FOOT, max_pt=18, min_pt=10)
+    _body(slide, ctx, "\n".join(parts)[:900], MX, y, CONTENT_W, H - y - ctx.foot, max_pt=18, min_pt=10)
     _footer(slide, ctx)
 
 
@@ -1079,29 +1395,36 @@ def render_deck(deck: Deck) -> bytes:
     prs.core_properties.author = "PitchCraft"
     blank = prs.slide_layouts[6]
     look = make_look(deck.theme)
-    total = len(deck.slides)
     prev_hero = False
 
-    for i, s in enumerate(deck.slides, start=1):
+    pages = [page for s in deck.slides for page in expand_slide(s)]
+    total = len(pages)
+    for i, s in enumerate(pages, start=1):
         slide = prs.slides.add_slide(blank)
+        sources = [x for x in (getattr(s, "sources", None) or []) if x and x.strip()]
         ctx = Ctx(deck=deck, look=look, index=i, total=total, prev_hero=prev_hero,
-                  strong_decor=getattr(s, "layout", "") in ("cover", "divider", "fin"))
-        builder = BUILDERS.get(getattr(s, "layout", ""), build_fallback)
+                  strong_decor=getattr(s, "layout", "") in ("cover", "divider", "fin"),
+                  extra=FOOTNOTE_EXTRA if sources else 0.0)
+        builder = PAGE_BUILDERS.get(type(s)) or BUILDERS.get(getattr(s, "layout", ""), build_fallback)
         try:
             builder(slide, s, ctx)
+            _footnote(slide, ctx, sources)
         except Exception:
             logger.exception("deck_render: %s slide %d failed; using fallback", getattr(s, "layout", "?"), i)
             _clear(slide)
             ctx.credits.clear()
             try:
                 build_fallback(slide, s, ctx)
+                _footnote(slide, ctx, sources)
             except Exception:
                 logger.exception("deck_render: fallback failed for slide %d", i)
         prev_hero = ctx.used_hero
         notes = (getattr(s, "notes", "") or "").strip()
+        if ctx.footnotes:
+            notes = (notes + "\n\nSources:\n" + "\n".join(f"- {x}" for x in ctx.footnotes)).strip()
         if ctx.credits:
-            sources = "\n".join(f"- {c}" for c in dict.fromkeys(ctx.credits))
-            notes = f"{notes}\n\nImage sources (internal pitching only):\n{sources}".strip()
+            credits = "\n".join(f"- {c}" for c in dict.fromkeys(ctx.credits))
+            notes = f"{notes}\n\nImage sources (internal pitching only):\n{credits}".strip()
         set_notes(slide, notes)
 
     buf = io.BytesIO()

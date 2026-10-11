@@ -171,8 +171,9 @@ class TwoColumnSlide(_Slide):
 class TableSlide(_Slide):
     layout: Literal["table"] = "table"
     strip: Text(160) = ""
-    headers: Annotated[list[Text(40)], BeforeValidator(_take(6))] = Field(min_length=2)
-    rows: Annotated[list[Annotated[list[Text(160)], BeforeValidator(_take(6))]], BeforeValidator(_take(10))]
+    # Up to 8 columns (e.g. a weekly content calendar); the renderer sizes columns by content.
+    headers: Annotated[list[Text(40)], BeforeValidator(_take(8))] = Field(min_length=2)
+    rows: Annotated[list[Annotated[list[Text(160)], BeforeValidator(_take(8))]], BeforeValidator(_take(10))]
 
 
 class KpiTableSlide(TableSlide):
