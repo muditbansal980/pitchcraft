@@ -122,3 +122,60 @@ Open items:
 - `frontend/src/app/layout.tsx` description still says "Look up brand info for pitches" (user-owned file, not changed)
 - npm reported audit warnings when installing react-markdown (not investigated)
 - Free tier: two plans within a minute may hit Groq's 8K tokens/min limit → 429 with a "try again in a minute" message
+
+---
+
+# v2 — Designed pitch decks (branch `feature/pitchcraft-v2`)
+
+Full plan: variable-size decks (focused 6–10 / standard 15–22 / flagship 30–45 slides), multi-model LLM routing (Groq pool + Gemini), visuals (Reddit, Tavily images, Imgflip, AI mocks, Gemini vision picking), themes, PPTX export, Canva import. Coordinator: main Claude session (contracts, review, integration, PR).
+
+## v2 contracts
+
+### C3 (updated) — `POST /api/brand-plan`
+Request `{"brand": str, "brief"?: str (≤2000), "scale"?: "auto"|"focused"|"standard"|"flagship"}`.
+Response adds `scale` (resolved), `brief`, `deck: Deck` (`plan` Markdown is now derived from `deck`). Errors unchanged; 429 only when every model for a role is exhausted.
+
+### C4 — Deck schema: `backend/app/schemas/deck.py`
+`Deck{title, brand, scale, theme: Theme, slides: [Slide]}`; `Slide` is a discriminated union on `layout` (`SLIDE_LAYOUTS`). Text is clipped, lists truncated, never rejected for length. `Visual` = request fields (`want`, `brief`, `query`, `meme_template_id`, `meme_boxes`, written by LLM) + result fields (`kind`, `url` = `/media/<file>`, `source_url`, `credit`, written by visuals). Frontend mirrors it in `frontend/src/lib/types.ts`.
+
+### C5 — Deck/Canva endpoints
+- `POST /api/deck/pptx` body `Deck` → `application/vnd.openxmlformats-officedocument.presentationml.presentation` (attachment).
+- `GET /api/canva/status` → `{connected, configured}`; `GET /api/canva/authorize` → `{url}`; `POST /api/canva/callback` `{code, state}` → `{connected: true}`; `DELETE /api/canva/connection` → 204; `POST /api/canva/import` body `Deck` → `{edit_url, view_url}`.
+- All require the logged-in user (`CurrentUser`), FastAPI `{detail}` errors (503 when the feature's keys are missing).
+- `GET /media/<file>` static images (no auth).
+
+### C6 — LLM router: `backend/app/services/llm_router.py`
+`invoke_text(role, messages, *, max_tokens, temperature, prefer)`, `invoke_json(role, messages, schema, ...)`, `invoke_vision_json(prompt, images) -> dict | None`, `LLMUnavailableError`. Roles: strategist, writer, editor, vision (`settings.llm_roles`). `prefer=i` rotates the model list so parallel writers hit different models.
+
+### C7 — Visuals / themes / render
+- `media.save_image(bytes) -> "/media/<sha1>.jpg"`, `media.resolve_media(url) -> Path | None`
+- `trends.get_trend_pulse(extra_subreddits) -> TrendPulse`, `trends.search_reddit_images(query, limit)`
+- `visuals.get_meme_templates() -> [MemeTemplate{id, name, box_count}]`, `visuals.attach_visuals(deck, VisualBudget{ref, meme, mock}) -> Deck`
+- `themes.THEME_DESCRIPTIONS`, `themes.ThemeChoice{name, accent_hint, hero_prompt}`, `themes.probe_brand_colors(brand) -> [hex]`, `themes.resolve_theme(choice, brand_colors) -> Theme`
+- `deck_render.render_deck(deck) -> bytes` (sync), `PPTX_MIME`
+- `MemeTemplate` also has optional `url` (blank template image, used for local captioning when no Imgflip account).
+- The theme hero image is attempted outside `VisualBudget` (one per deck).
+- `Theme.accent_2` is a fill colour only (always black/white text on it), so it is not contrast-checked against `bg`.
+- Stubs return safe empty defaults (except `render_deck`, `save_image`, `resolve_media`, `invoke_*`) so agents can build in parallel.
+
+## v2 agent assignments (exclusive file ownership, no commits by agents)
+
+| Agent | Owns |
+|---|---|
+| A — LLM + generation | `services/llm_router.py`, `services/brand_plan.py`, `services/retrieval.py`, `api/routes/plan.py` |
+| B — Visuals + themes + PPTX | `services/media.py`, `services/visuals.py`, `services/trends.py`, `services/themes.py`, `services/deck_render.py`, `api/routes/deck.py` |
+| C — Canva + frontend | `api/routes/canva.py`, `services/canva.py`, `models/canva_token.py`, `models/__init__.py`, `alembic/versions/*` (new), everything in `frontend/` |
+| Coordinator | `schemas/*`, `core/config.py`, `main.py`, `.env.example`, `pyproject.toml`/`uv.lock`, `WORKPLAN.md` |
+
+Need a contract change? Report it to the coordinator instead of editing a file you don't own.
+
+## v2 progress log
+- [x] Step 0 — branch, contracts (C3–C7), stubs, settings, deps (`python-pptx`, `pillow`, `cryptography`, `langchain-google-genai`, `httpx`), `/media` mount
+- [x] Agent A — generation pipeline. **Accepted** (coordinator checked: imports clean, Audible flagship deck in story-arc order, no @handles; 5 real runs on Groq: Thums Up → focused 10 slides 78 s, Audible → flagship 26–29 slides 105–151 s). Verified Groq ids: gpt-oss-120b, gpt-oss-20b, qwen3.8-27b (qwen OTPM 1K on free tier). Gemini ids from docs only (gemini-3.8-flash, gemini-3.5-flash-lite), untested without a key. Gap: flagship on Groq alone lands just under 30 slides (post-run fixes verified offline only).
+- [x] B follow-up — brand identity themes (website colours/fonts/logo/products, season) + meme freshness/diversity (user feedback 2026-10-11). **Accepted** (coordinator reviewed identity_compare sheet: 5 brands clearly distinct; meme runs show no in-deck repeats and rotation across runs). New: `brand_identity.probe_brand_identity`, `brand_identity_season.detect_season`, `memes.meme_shortlist`/`record_meme_use`, 46 measured meme layouts, decor patterns, logo on cover/fin. Untested without keys: AI meme scenes/season hero, vision font classification, Imgflip API captioning.
+- [x] A follow-up — wire `probe_brand_identity`, `detect_season`, `meme_shortlist`/`record_meme_use` into the pipeline. **Accepted** (real Zomato Diwali run: standard 22 slides 72 s, identity used: Lexend, brand red, logo; memes all from shortlist, no repeats). Season-from-brief, stricter stats, TikTok ban verified offline only.
+- [x] B polish — title overflow, placeholders, watermarked heroes, captionable templates, richer product motifs. **Accepted** (coordinator reviewed zomato_fixed sheets: 21/21 slots filled, no watermark, no title collisions; `identity.products` e.g. Zomato Gold/Live/Pay, Thums Up Charged/XForce).
+- [x] Agent B — visuals, themes, PPTX. **Accepted** (coordinator reviewed rendered sheets for the fixture deck and A's Audible deck; re-rendered fixture 16 slides in 0.17 s, empty deck OK). Live: Tavily images (Instagram reels via og:image), brand colour probe, Imgflip templates (local captioning). Not working without keys: Pollinations (402 anonymous, watermark), Reddit (RSS fallback, 429s), Cloudflare/Imgflip captioning/Reddit OAuth untested. Vision picking falls back to description match until Gemini is set.
+- [x] Agent C — Canva + frontend. **Accepted** (coordinator re-ran: eslint clean, `tsc --noEmit` clean, 12/12 Canva service mock checks, route TestClient checks). Notes: stateless Fernet-encrypted OAuth state; single-use refresh tokens serialised per user; Node fetch has a hard 300 s headers timeout so >290 s requests use `node:http`; callback uses a relative redirect to keep the 127.0.0.1 cookie. Unverified: real Canva OAuth/import (no keys), browser click-through.
+- [x] Integration test (coordinator, real HTTP API on :8004, Groq + Tavily only): signup 201; Thums Up + amp-burst brief → focused 10 slides 36 s; Spotify scale=flagship → 30 slides 180 s (override honoured); Nykaa + Diwali sale brief → standard 22 slides 164 s, season diwali + diyas. All PPTX 200 with attachment headers; no TikTok, no @handles, no watermarks; brand logo/colours/fonts per brand. Found + fixed: timelines starting in the past are shifted forward in code. Skipped (no keys): Gemini, Canva OAuth/import, Reddit OAuth, Imgflip API, AI image generation.
+- [x] PR — https://github.com/muditbansal980/pitchcraft/pull/2
