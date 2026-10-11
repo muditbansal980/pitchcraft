@@ -30,7 +30,6 @@ import difflib
 import inspect
 import json
 import logging
-import math
 import re
 import time
 from collections import defaultdict
@@ -67,33 +66,23 @@ from app.schemas.deck import (
 )
 from app.schemas.plan import BrandPlanResponse, PastPitchRef
 from app.schemas.research import BrandDossier
-from app.services import brand_identity, llm_router, memes, research_deep, service_playbooks, themes, trends, visuals
-from app.services.plan_dossier import (
-    dossier_corpus,
-    dossier_slice,
-    extract_fact_ids,
-    fact_for_stat,
-    facts_by_id,
-    is_deep,
-    mentions_any,
-    render_dossier,
-    source_label,
-    specific_terms,
-    strip_fact_ids,
-)
-from app.services.plan_services import (
-    ServicePlan,
-    render_playbooks,
-    deep_dive_slides,
-    ecosystem_slide,
-    enforce_idea_services,
-    matrix_slide,
-    normalise_plan,
-    offer_table,
-    plan_services,
+from app.services import (
+    brand_identity,
+    llm_router,
+    memes,
+    research_deep,
+    service_playbooks,
+    themes,
+    trends,
+    visuals,
 )
 from app.services.brand_identity import BrandIdentity
-from app.services.brand_identity_season import SEASONS, detect_season_detail, fix_event_dates, season_timing
+from app.services.brand_identity_season import (
+    SEASONS,
+    detect_season_detail,
+    fix_event_dates,
+    season_timing,
+)
 from app.services.brand_research import research_brand
 from app.services.plan_checks import (
     BANNED_PLATFORM_RE,
@@ -110,13 +99,26 @@ from app.services.plan_checks import (
     strip_handles,
     unsupported_stats,
 )
+from app.services.plan_dossier import (
+    dossier_corpus,
+    dossier_slice,
+    extract_fact_ids,
+    fact_for_stat,
+    facts_by_id,
+    is_deep,
+    mentions_any,
+    render_dossier,
+    source_label,
+    specific_terms,
+    strip_fact_ids,
+)
 from app.services.plan_markdown import deck_to_markdown
 from app.services.plan_models import (
     BUCKET_LAYOUTS,
     DEFAULT_MODULES,
     EXTRA_LAYOUTS,
-    MODULES,
     LAYOUT_WEIGHT,
+    MODULES,
     PROFILES,
     SECTIONS,
     PlanItem,
@@ -133,6 +135,17 @@ from app.services.plan_prompts import (
     STRATEGIST_SYSTEM,
     STYLE_GUIDE,
     WRITER_SYSTEM,
+)
+from app.services.plan_services import (
+    ServicePlan,
+    deep_dive_slides,
+    ecosystem_slide,
+    enforce_idea_services,
+    matrix_slide,
+    normalise_plan,
+    offer_table,
+    plan_services,
+    render_playbooks,
 )
 from app.services.retrieval import (
     CraftExcerpt,
