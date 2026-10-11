@@ -30,7 +30,6 @@ import difflib
 import inspect
 import json
 import logging
-import math
 import re
 import time
 from collections import defaultdict
@@ -67,33 +66,23 @@ from app.schemas.deck import (
 )
 from app.schemas.plan import BrandPlanResponse, PastPitchRef
 from app.schemas.research import BrandDossier
-from app.services import brand_identity, llm_router, memes, research_deep, service_playbooks, themes, trends, visuals
-from app.services.plan_dossier import (
-    dossier_corpus,
-    dossier_slice,
-    extract_fact_ids,
-    fact_for_stat,
-    facts_by_id,
-    is_deep,
-    mentions_any,
-    render_dossier,
-    source_label,
-    specific_terms,
-    strip_fact_ids,
-)
-from app.services.plan_services import (
-    ServicePlan,
-    render_playbooks,
-    deep_dive_slides,
-    ecosystem_slide,
-    enforce_idea_services,
-    matrix_slide,
-    normalise_plan,
-    offer_table,
-    plan_services,
+from app.services import (
+    brand_identity,
+    llm_router,
+    memes,
+    research_deep,
+    service_playbooks,
+    themes,
+    trends,
+    visuals,
 )
 from app.services.brand_identity import BrandIdentity
-from app.services.brand_identity_season import SEASONS, detect_season_detail
+from app.services.brand_identity_season import (
+    SEASONS,
+    detect_season_detail,
+    fix_event_dates,
+    season_timing,
+)
 from app.services.brand_research import research_brand
 from app.services.plan_checks import (
     BANNED_PLATFORM_RE,
@@ -110,19 +99,39 @@ from app.services.plan_checks import (
     strip_handles,
     unsupported_stats,
 )
+from app.services.plan_dossier import (
+    dossier_corpus,
+    dossier_slice,
+    extract_fact_ids,
+    fact_for_stat,
+    facts_by_id,
+    is_deep,
+    mentions_any,
+    render_dossier,
+    source_label,
+    specific_terms,
+    strip_fact_ids,
+)
 from app.services.plan_markdown import deck_to_markdown
 from app.services.plan_models import (
     BUCKET_LAYOUTS,
     DEFAULT_MODULES,
     EXTRA_LAYOUTS,
-    MODULES,
     LAYOUT_WEIGHT,
+    MODULES,
     PROFILES,
     SECTIONS,
     PlanItem,
     ScaleProfile,
     ServicePick,
     Strategy,
+)
+from app.services.plan_moments import (
+    add_moment_facts,
+    covered_keywords,
+    fix_moment_dates,
+    moments_prompt,
+    verify_moments,
 )
 from app.services.plan_prompts import (
     CORE_RULES,
@@ -133,6 +142,17 @@ from app.services.plan_prompts import (
     STRATEGIST_SYSTEM,
     STYLE_GUIDE,
     WRITER_SYSTEM,
+)
+from app.services.plan_services import (
+    ServicePlan,
+    deep_dive_slides,
+    ecosystem_slide,
+    enforce_idea_services,
+    matrix_slide,
+    normalise_plan,
+    offer_table,
+    plan_services,
+    render_playbooks,
 )
 from app.services.retrieval import (
     CraftExcerpt,
@@ -201,6 +221,8 @@ class Inputs:
     shown_pitches: dict[str, tuple[str, str]] = field(default_factory=dict)
     banned: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
+    # Real-world events the strategy builds on, with dates read from live sources (plan_moments).
+    moments: list[Any] = field(default_factory=list)
 
     @property
     def meme_ids(self) -> dict[str, visuals.MemeTemplate]:
@@ -425,13 +447,42 @@ def _fmt_memes(memes: list[visuals.MemeTemplate], n: int) -> str:
     return "\n".join(f"{m.id} | {m.name} | {m.box_count}" for m in memes[:n])
 
 
+def _fix_dates(text: str, inputs: Any) -> str:
+    """Verified (sourced) event dates first, then the built-in calendar for moments not verified."""
+    moments = getattr(inputs, "moments", None) or []
+    text = fix_moment_dates(text, moments, date.today())
+    return fix_event_dates(text, date.today(), skip=covered_keywords(moments))
+
+
+def _apply_moments(inputs: Inputs, strategy: Strategy) -> None:
+    """Verified dates become sourced facts, and the strategy's own text is corrected before writers see it."""
+    if not inputs.moments:
+        return
+    add_moment_facts(inputs.dossier, inputs.moments)
+    inputs.refresh_corpus()
+    strategy.why_now = _fix_dates(strategy.why_now, inputs)
+    strategy.moment = _fix_dates(strategy.moment, inputs)
+    for phase in strategy.phases:
+        if getattr(phase, "when", None):
+            phase.when = _fix_dates(phase.when, inputs)
+
+
+def _moment_rule(key: str) -> str:
+    """Real calendar dates for the moment, so the LLM never moves an event to fit 'now'."""
+    timing = season_timing(key, date.today())
+    if not timing:
+        return ""
+    return (f"Calendar truth (today {date.today():%d %b %Y}): {timing}. Never change a moment's real dates; "
+            "if it is weeks or months away, pitch a build-up/pre-season plan timed to the real window.")
+
+
 def _season_line(inputs: Inputs) -> str:
     ident = inputs.identity
     season = SEASONS.get(ident.season) if ident and ident.season else None
     if not season:
         return "MOMENT: none detected."
     where = "named in the brief/research" if ident.season_source == "text" else "calendar guess for launch in ~2 weeks"
-    return f'MOMENT: {season.label} (key "{season.key}", {where}).'
+    return f'MOMENT: {season.label} (key "{season.key}", {where}). {_moment_rule(season.key)}'
 
 
 def _fmt_identity(inputs: Inputs) -> str:
@@ -1040,8 +1091,14 @@ def _writer_messages(
             "BRAND OBJECTS (use these real products/objects in ideas and visual briefs): "
             + ", ".join(inputs.identity.motifs[:6])
         )
+    verified = moments_prompt(inputs.moments, date.today())
     if strategy.season and strategy.season in SEASONS:
-        parts.append(f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it.")
+        parts.append(
+            f"MOMENT: {SEASONS[strategy.season].label}; tie ideas, captions and visual briefs to it. "
+            + ("" if verified else _moment_rule(strategy.season))
+        )
+    if verified:
+        parts.append(verified)
     if needs_memes:
         parts.append(
             "MEME TEMPLATES (id | name | boxes): use ONLY these ids, each at most once, with exactly its number of boxes\n"
@@ -1774,6 +1831,7 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
                 cited.extend(extract_fact_ids(value))
                 value = strip_fact_ids(value)
             out = strip_handles(value) if "@" in value else value
+            out = _fix_dates(out, inputs)
             out = BANNED_PLATFORM_RE.sub("YouTube Shorts", out)
             out = _FILLER_RE.sub(lambda m: _match_case(m.group(0), _FILLER_FIX[m.group(0).lower()]), out)
             out = re.sub(r"YouTube Shorts(\s*(?:/|,|\+|and|&)\s*(?:YouTube |YT )?Shorts)+", "YouTube Shorts", out, flags=re.IGNORECASE)
@@ -1969,10 +2027,13 @@ async def generate_brand_plan(
         # Services woven in: a second strategy call decides fit, combo, per-bucket powering and the matrix.
         t = time.monotonic()
         dossier_view = render_dossier(inputs.dossier, 5000) if inputs.dossier else ""
-        planned, _ = await asyncio.gather(
+        planned, _, inputs.moments = await asyncio.gather(
             plan_services(brand, brief, inputs.today, strategy, resolved, inputs.services, inputs.playbooks, dossier_view),
             _refresh_shortlist(inputs, strategy),
+            # Never trust the model's memory for event dates: verify them against live sources.
+            verify_moments(strategy, date.today()),
         )
+        _apply_moments(inputs, strategy)
         inputs.service_plan = normalise_plan(planned, strategy, inputs.services, resolved)
         inputs.timings["services"] = time.monotonic() - t
         sp = inputs.service_plan

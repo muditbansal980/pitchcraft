@@ -1,7 +1,15 @@
 import type { ResearchSection } from "@/lib/types";
 
+/** Research can return the same article twice; keep the first of each URL (also keeps React keys unique). */
+function uniqueByUrl<T extends { url: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => !seen.has(item.url) && seen.add(item.url));
+}
+
 export function ResearchSources({ research }: { research: ResearchSection[] }) {
-  const sections = research.filter((section) => section.sources.length > 0);
+  const sections = research
+    .map((section) => ({ ...section, sources: uniqueByUrl(section.sources) }))
+    .filter((section) => section.sources.length > 0);
   if (sections.length === 0) return null;
 
   return (
@@ -13,8 +21,8 @@ export function ResearchSources({ research }: { research: ResearchSection[] }) {
         Research sources
       </summary>
       <div className="flex flex-col gap-4 border-t-3 border-foreground px-4 py-3">
-        {sections.map((section) => (
-          <div key={section.title} className="flex flex-col gap-1">
+        {sections.map((section, i) => (
+          <div key={`${i}-${section.title}`} className="flex flex-col gap-1">
             <h3 className="text-sm font-bold uppercase">{section.title}</h3>
             <ul className="flex flex-col gap-1 text-sm">
               {section.sources.map((source) => (

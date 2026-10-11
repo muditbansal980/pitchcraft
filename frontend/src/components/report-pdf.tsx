@@ -294,7 +294,9 @@ function ReportDocument({ report, tree, images }: DocumentProps) {
             {sections.map((section) => (
               <View key={section.title} style={s.sourceGroup}>
                 <Text style={s.sourceHeading} minPresenceAhead={20}>{clean(section.title)}</Text>
-                {section.sources.map((source) => (
+                {section.sources
+                  .filter((source, i, all) => all.findIndex((other) => other.url === source.url) === i)
+                  .map((source) => (
                   <View key={source.url} style={s.source} wrap={false}>
                     <Link src={source.url} style={s.link}>
                       {clean(source.title || source.url)}

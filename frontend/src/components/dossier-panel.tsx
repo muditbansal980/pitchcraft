@@ -46,7 +46,11 @@ const linkClass = "underline decoration-2 underline-offset-2 hover:bg-accent hov
 /** What the deep research read and the strongest sourced facts it found. */
 export function DossierPanel({ dossier }: { dossier: BrandDossier }) {
   const facts = (dossier.facts ?? []).filter((fact) => fact.text).slice(0, MAX_FACTS);
-  const sources = (dossier.sources ?? []).filter((source) => safeHref(source.url));
+  // The same page can be read via several searches; list each URL once (also keeps React keys unique).
+  const seen = new Set<string>();
+  const sources = (dossier.sources ?? []).filter(
+    (source) => safeHref(source.url) && !seen.has(source.url) && seen.add(source.url),
+  );
   if (facts.length === 0 && sources.length === 0) return null;
   const pagesRead = dossier.pages_read ?? sources.length;
 
