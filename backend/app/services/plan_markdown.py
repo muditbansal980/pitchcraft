@@ -65,6 +65,7 @@ def _slide_lines(slide) -> list[str]:
             out.append(f"**{slide.strip}**")
         if slide.body:
             out.append(slide.body)
+        out += [f"- {b}" for b in slide.bullets]
     elif isinstance(slide, FromToSlide):
         if slide.strip:
             out.append(f"**{slide.strip}**")
@@ -90,6 +91,15 @@ def _slide_lines(slide) -> list[str]:
         ):
             if value:
                 out.append(f"- **{label}:** {value}")
+        if slide.execution:
+            out.append("**Execution**")
+            out += [f"- {k}. {step}" for k, step in enumerate(slide.execution, start=1)]
+        if slide.sample_posts:
+            out.append("**Sample posts**")
+            out += [f"- “{p}”" for p in slide.sample_posts]
+        if slide.services:
+            out.append(f"**Powered by:** {', '.join(slide.services)}"
+                       + (f" ({slide.service_mechanics})" if slide.service_mechanics else ""))
         out += _visual(slide.visual)
     elif isinstance(slide, SamplesSlide):
         if slide.strip:
@@ -145,6 +155,8 @@ def deck_to_markdown(deck: Deck) -> str:
             lines += _join(body)
         if slide.notes and not isinstance(slide, FinSlide):
             lines += ["", slide.notes]
+        if slide.sources:
+            lines += ["", "*Sources: " + "; ".join(_cell(x) for x in slide.sources) + "*"]
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks).strip() + "\n"
 

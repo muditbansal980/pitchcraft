@@ -248,7 +248,8 @@ _TIER_CONTEXT = re.compile(r"\b(nano|micro|mid|macro|mega|tier|followers?|upto|u
 NARRATIVE_LAYOUTS = {"cover", "statement", "from_to", "formula", "divider", "two_column", "ref"}
 BANNED_PLATFORM_RE = re.compile(r"\btik\s?tok\b", re.IGNORECASE)
 # Fields that hold our proposals (creator tiers, scale, timing), never claims about the brand or market.
-PROPOSAL_KEYS = {"creator", "scalability", "format", "when", "tags", "query", "brief", "meme_boxes"}
+PROPOSAL_KEYS = {"creator", "scalability", "format", "when", "tags", "query", "brief", "meme_boxes",
+                 "execution", "service_mechanics", "sample_posts", "services"}
 _TARGET_CONTEXT = re.compile(r"target|goal|aim|we will|we'll|plan to|month \d|week \d|kpi", re.IGNORECASE)
 
 
@@ -317,7 +318,7 @@ def soften_stats(text: str, stats: list[str]) -> str:
     kept = [s for s in sentences if not any(st in s for st in stats)]
     if kept:
         return " ".join(kept)
-    clauses = re.split(r"\s*(?:;|,|\u2014|\s-\s|\|)\s*", text)
+    clauses = re.split(r"\s*(?:;|,|\u2014|\s-\s|\||\band\b|\bbut\b|\bwhile\b)\s*", text)
     kept = [c for c in clauses if c.strip() and not any(st in c for st in stats)]
     return ", ".join(kept).strip(" ,;:")
 

@@ -5,13 +5,14 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.deps import DbSession
-from app.api.routes import auth, brand, canva, deck, plan
+from app.api.routes import auth, brand, canva, deck, plan, plan_jobs
 from app.core.config import settings
 
 app = FastAPI(title=settings.app_name)
 app.include_router(auth.router)
 app.include_router(brand.router)
 app.include_router(plan.router)
+app.include_router(plan_jobs.router)
 app.include_router(deck.router)
 app.include_router(canva.router)
 

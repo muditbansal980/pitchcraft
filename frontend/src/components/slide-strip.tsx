@@ -100,6 +100,7 @@ export function SlideStrip({ deck }: { deck: Deck }) {
         {deck.slides.map((slide, i) => {
           const image = slideImage(slide, deck.theme);
           const detail = slideDetail(slide);
+          const services = slide.layout === "idea" ? (slide.services ?? []).filter(Boolean) : [];
           return (
             <li
               key={i}
@@ -128,6 +129,11 @@ export function SlideStrip({ deck }: { deck: Deck }) {
                 {detail && (
                   <p className="line-clamp-2 text-[9px] leading-tight" style={{ color: muted }}>
                     {detail}
+                  </p>
+                )}
+                {services.length > 0 && (
+                  <p className="line-clamp-1 font-mono text-[8px] leading-tight font-bold uppercase" style={{ color: accent }}>
+                    Powered by {services.join(" · ")}
                   </p>
                 )}
                 <span className="mt-auto font-mono text-[9px]" style={{ color: muted }}>

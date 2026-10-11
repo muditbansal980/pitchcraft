@@ -25,7 +25,9 @@ Pipeline (WORKPLAN C3/C4, plan sections 1, 3, 7):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
+import inspect
 import json
 import logging
 import math
@@ -64,7 +66,32 @@ from app.schemas.deck import (
     Visual,
 )
 from app.schemas.plan import BrandPlanResponse, PastPitchRef
-from app.services import brand_identity, llm_router, memes, themes, trends, visuals
+from app.schemas.research import BrandDossier
+from app.services import brand_identity, llm_router, memes, research_deep, service_playbooks, themes, trends, visuals
+from app.services.plan_dossier import (
+    dossier_corpus,
+    dossier_slice,
+    extract_fact_ids,
+    fact_for_stat,
+    facts_by_id,
+    is_deep,
+    mentions_any,
+    render_dossier,
+    source_label,
+    specific_terms,
+    strip_fact_ids,
+)
+from app.services.plan_services import (
+    ServicePlan,
+    render_playbooks,
+    deep_dive_slides,
+    ecosystem_slide,
+    enforce_idea_services,
+    matrix_slide,
+    normalise_plan,
+    offer_table,
+    plan_services,
+)
 from app.services.brand_identity import BrandIdentity
 from app.services.brand_identity_season import SEASONS, detect_season_detail
 from app.services.brand_research import research_brand
@@ -73,10 +100,12 @@ from app.services.plan_checks import (
     NARRATIVE_LAYOUTS,
     PRICE_RE,
     PROPOSAL_KEYS,
+    STAT_RE,
     banned_terms,
     find_issues,
     match_service,
     similar_titles,
+    slide_text,
     soften_stats,
     strip_handles,
     unsupported_stats,
@@ -84,7 +113,9 @@ from app.services.plan_checks import (
 from app.services.plan_markdown import deck_to_markdown
 from app.services.plan_models import (
     BUCKET_LAYOUTS,
+    DEFAULT_MODULES,
     EXTRA_LAYOUTS,
+    MODULES,
     LAYOUT_WEIGHT,
     PROFILES,
     SECTIONS,
@@ -127,11 +158,13 @@ _STRATEGIST_TOKENS = {"focused": 2200, "standard": 2800, "flagship": 3000}
 _RICH_CAPACITY = 40_000
 # Writer prompt size we plan for when splitting the deck into groups.
 _WRITER_PROMPT_BUDGET = 4300
-_WRITER_MAX_OUTPUT = 6000
+_WRITER_MAX_OUTPUT = 8000
+# Per-bucket writer calls queue on the same few Groq models: allow a longer (still bounded) wait.
+_WRITER_MAX_WAIT = 180.0
 _EDITOR_SYSTEM_TOKENS = 1300
 _SERVICE_LIMIT = {"focused": 3, "standard": 5, "flagship": 7}
 # Retry failed writer groups only if the first pass finished within this many seconds.
-_WRITER_RETRY_WITHIN = 150.0
+_WRITER_RETRY_WITHIN = 240.0
 
 
 class ServicesCatalogEmptyError(RuntimeError):
@@ -157,7 +190,12 @@ class Inputs:
     trend: trends.TrendPulse = field(default_factory=trends.TrendPulse)
     memes: list[visuals.MemeTemplate] = field(default_factory=list)  # shortlist(s): the only allowed templates
     identity: BrandIdentity | None = None
+    dossier: BrandDossier | None = None
+    playbooks: dict[str, Any] = field(default_factory=dict)
+    service_plan: ServicePlan | None = None
+    on_stage: Any = None
     colors: list[str] = field(default_factory=list)
+    corpus: str = ""  # research + dossier text, the "supported facts" corpus (set by refresh_corpus)
     full_texts: dict[str, str] = field(default_factory=dict)
     shown_texts: list[str] = field(default_factory=list)
     shown_pitches: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -170,11 +208,24 @@ class Inputs:
 
     @property
     def research_text(self) -> str:
+        if self.corpus:
+            return self.corpus
         parts = []
         for s in self.research:
             parts.append(s.summary)
             parts += [f"{src.title} {src.snippet}" for src in s.sources]
         return "\n".join(parts) + "\n" + (self.brief or "")
+
+    def refresh_corpus(self) -> None:
+        self.corpus = ""
+        self.corpus = self.research_text + "\n" + dossier_corpus(self.dossier)
+
+    @property
+    def deep(self) -> bool:
+        return is_deep(self.dossier)
+
+    async def stage(self, name: str, progress: float) -> None:
+        await _emit(self.on_stage, name, progress)
 
     @property
     def allowed_text(self) -> str:
@@ -186,6 +237,25 @@ class Inputs:
         return "\n".join(parts)
 
 
+# Overall progress (0..1) at the start of each C8 stage.
+STAGE_PROGRESS = {
+    "research": 0.02, "identity": 0.12, "deep_research": 0.18, "strategy": 0.45, "writing": 0.55,
+    "editing": 0.8, "visuals": 0.88, "done": 1.0,
+}
+
+
+async def _emit(on_stage: Any, name: str, progress: float) -> None:
+    """Call ``on_stage(name, progress)`` (sync or async); a failing callback never breaks the plan."""
+    if on_stage is None:
+        return
+    try:
+        result = on_stage(name, round(min(1.0, max(0.0, progress)), 3))
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("on_stage(%r) failed: %s", name, exc)
+
+
 async def _safe(coro, default, what: str):
     try:
         return await coro
@@ -194,8 +264,9 @@ async def _safe(coro, default, what: str):
         return default
 
 
-async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inputs:
+async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale, on_stage: Any = None) -> Inputs:
     started = time.monotonic()
+    await _emit(on_stage, "research", STAGE_PROGRESS["research"])
     services = await asyncio.to_thread(load_services_catalog)
     if not services:
         raise ServicesCatalogEmptyError("WLDD services collection is empty")
@@ -204,7 +275,8 @@ async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inp
         # up front, so the strategist sizes buckets and slides for it.
         logger.info("Auto scale for %r resolved from the brief: %s", brand, stated)
         scale = stated
-    inputs = Inputs(brand=brand, brief=brief, requested_scale=scale, today=date.today().strftime("%d %B %Y"), services=services)
+    inputs = Inputs(brand=brand, brief=brief, requested_scale=scale, today=date.today().strftime("%d %B %Y"),
+                    services=services, on_stage=on_stage)
 
     # The identity probe mostly reads the brand's website, so it runs alongside research with no
     # research text; motifs and the season are re-derived from the research afterwards.
@@ -215,6 +287,7 @@ async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inp
         _safe(brand_identity.probe_brand_identity(brand, ""), None, "Brand identity"),
     )
     inputs.research = research.sections
+    await inputs.stage("identity", STAGE_PROGRESS["identity"])
     inputs.trend = pulse or trends.TrendPulse()
     inputs.memes = [m for m in (shortlist or []) if m.box_count >= 1]
     ident = ident or BrandIdentity(brand=brand)
@@ -240,6 +313,29 @@ async def _gather_inputs(brand: str, brief: str | None, scale: PlanScale) -> Inp
         texts = await asyncio.gather(*(asyncio.to_thread(load_pitch_full_text, p.pitch_id) for p in inputs.pitches))
         inputs.full_texts = {p.pitch_id: text for p, text in zip(inputs.pitches, texts) if text}
     inputs.timings["retrieval"] = time.monotonic() - t
+
+    # Deep research: the brand's own pages + full articles, distilled into a sourced dossier.
+    await inputs.stage("deep_research", STAGE_PROGRESS["deep_research"])
+    t = time.monotonic()
+    lo, hi = STAGE_PROGRESS["deep_research"], STAGE_PROGRESS["strategy"]
+
+    async def sub_stage(_name: str, fraction: float) -> None:
+        await inputs.stage("deep_research", lo + (hi - lo) * min(1.0, max(0.0, fraction)))
+
+    dossier_scale = scale if scale in PROFILES else "standard"
+    inputs.dossier = await _safe(
+        research_deep.build_dossier(brand, brief, inputs.research, identity=ident, scale=dossier_scale, on_stage=sub_stage),
+        None, "Deep research",
+    )
+    inputs.playbooks = await _safe(asyncio.to_thread(service_playbooks.load_playbooks), {}, "Service playbooks")
+    inputs.refresh_corpus()
+    inputs.timings["deep_research"] = time.monotonic() - t
+    d = inputs.dossier
+    logger.info(
+        "Dossier for %r: depth=%s, %d pages, %d facts, %d products, %d campaigns, %d competitors; %d playbooks (%.1fs)",
+        brand, d.depth if d else "-", d.pages_read if d else 0, len(d.facts) if d else 0, len(d.products) if d else 0,
+        len(d.recent_campaigns) if d else 0, len(d.competitors) if d else 0, len(inputs.playbooks), inputs.timings["deep_research"],
+    )
     logger.info(
         "Plan inputs for %r: %d research sections, %d pitches %s, %d trend posts, meme shortlist %s, identity site=%s "
         "colours=%s fonts=%s/%s logo=%s motifs=%s season=%s (%s)",
@@ -296,11 +392,13 @@ def _scrub(text: str, inputs: Inputs) -> str:
 # =========================================================================== context formatting
 
 _LEVELS = [
-    # name, summary chars, sources/section, snippet chars, trend posts, meme templates, pitch mode, brief chars, excerpt chars
-    ("rich", 4000, 5, 1500, 40, 40, "full", 600, 0),
-    ("standard", 1000, 3, 300, 20, 25, "excerpts", 380, 450),
-    ("compact", 800, 2, 220, 10, 10, "excerpts", 300, 320),
-    ("minimal", 600, 1, 160, 8, 8, "brief", 200, 0),
+    # name, summary chars, sources/section, snippet chars, trend posts, meme templates, pitch mode, brief chars,
+    # excerpt chars, dossier chars
+    ("rich", 4000, 5, 1500, 40, 40, "full", 600, 0, 16000),
+    ("standard", 1000, 3, 300, 20, 25, "excerpts", 380, 450, 9000),
+    ("compact", 800, 2, 220, 10, 10, "excerpts", 300, 320, 6000),
+    ("lean", 500, 1, 160, 8, 10, "brief", 220, 0, 4800),
+    ("minimal", 400, 1, 120, 6, 8, "brief", 160, 0, 3200),
 ]
 
 
@@ -351,8 +449,8 @@ def _fmt_identity(inputs: Inputs) -> str:
     return "BRAND IDENTITY: " + "; ".join(parts) + ".\n" + _season_line(inputs)
 
 
-def _fmt_services(services: list[Service]) -> str:
-    return "\n".join(f"- {s.name}: {s.description}" for s in services)
+def _fmt_services(services: list[Service], chars: int = 0) -> str:
+    return "\n".join(f"- {s.name}: {clip_text(s.description, chars) if chars else s.description}" for s in services)
 
 
 def _fmt_pitches(inputs: Inputs, mode: str, brief_chars: int, excerpt_chars: int) -> str:
@@ -373,7 +471,7 @@ def _fmt_pitches(inputs: Inputs, mode: str, brief_chars: int, excerpt_chars: int
 
 
 def _strategist_messages(inputs: Inputs, level: tuple) -> list:
-    name, summary, sources, snippet, n_trends, n_memes, mode, brief_chars, excerpt_chars = level
+    name, summary, sources, snippet, n_trends, n_memes, mode, brief_chars, excerpt_chars, dossier_chars = level
     scale = inputs.requested_scale
     scale_rule = SCALE_AUTO if scale == "auto" else SCALE_FIXED.format(scale=scale)
     buckets = (
@@ -390,10 +488,18 @@ def _strategist_messages(inputs: Inputs, level: tuple) -> list:
     human = (
         f"CLIENT BRIEF: {inputs.brief or 'none given (decide from research)'}\n"
         f"REQUESTED SCALE: {scale}\n\n"
-        f"BRAND RESEARCH ({inputs.brand})\n{_fmt_research(inputs.research, summary, sources, snippet)}\n\n"
-        f"TREND PULSE (top Indian Reddit posts this week)\n{_fmt_trends(inputs.trend, n_trends)}\n\n"
+        + (
+            # A deep dossier replaces the clipped Tavily snippets; only the moments section stays.
+            f"DOSSIER ({inputs.brand}; cite facts by id)\n{render_dossier(inputs.dossier, dossier_chars)}\n\n"
+            f"RECENT MOMENTS\n{_fmt_research([s for s in inputs.research if s.title.lower() == 'upcoming moments'], 500, 1, 160)}\n\n"
+            if inputs.deep else
+            f"BRAND RESEARCH ({inputs.brand})\n{_fmt_research(inputs.research, summary, sources, snippet)}\n\n"
+            + (f"DOSSIER (cite facts by id)\n{render_dossier(inputs.dossier, dossier_chars // 3)}\n\n"
+               if inputs.dossier and inputs.dossier.facts else "")
+        )
+        + f"TREND PULSE (top Indian Reddit posts this week)\n{_fmt_trends(inputs.trend, n_trends)}\n\n"
         f"MEME TEMPLATES (id | name | text boxes)\n{_fmt_memes(inputs.memes, n_memes)}\n\n"
-        f"WLDD SERVICES\n{_fmt_services(inputs.services)}\n\n"
+        f"WLDD SERVICES (a services lead details them next)\n{_fmt_services(inputs.services, 90)}\n\n"
         f"PAST PITCHES (confidential; mechanics only)\n{_fmt_pitches(inputs, mode, brief_chars, excerpt_chars)}\n\n"
         f"{_fmt_identity(inputs)}\n"
         f"THEMES: {themes_list}\n\n"
@@ -417,7 +523,7 @@ async def _run_strategist(inputs: Inputs) -> Strategy:
 
     messages, chosen = None, None
     for level in _LEVELS:
-        if level[6] == "full" and not inputs.full_texts:
+        if level[6] == "full" and not (inputs.full_texts or inputs.deep):
             continue
         messages = _strategist_messages(inputs, level)
         chosen = level[0]
@@ -532,15 +638,24 @@ def _normalise_strategy(strategy: Strategy, inputs: Inputs, profile: ScaleProfil
 # =========================================================================== slide plan
 
 
-def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_memes: bool = True) -> list[PlanItem]:
+def build_slide_plan(
+    strategy: Strategy, profile: ScaleProfile, brand: str, has_memes: bool = True, plan: ServicePlan | None = None,
+) -> list[PlanItem]:
     scale = profile.name
     big = strategy.big_idea
     items: list[PlanItem] = []
+    modules = list(dict.fromkeys(m for m in strategy.modules if m in MODULES)) or list(DEFAULT_MODULES[scale])
 
     def add(layout: str, title: str, brief: str, section: str, priority: int = 5, **kw: Any) -> PlanItem:
         item = PlanItem(i=0, layout=layout, title=title, brief=brief, section=section, priority=priority, **kw)
         items.append(item)
         return item
+
+    def module(key: str, priority: int) -> None:
+        if key not in modules:
+            return
+        layout, section, _sub, title, brief = MODULES[key]
+        add(layout, title, brief.format(brand=brand), section, priority=priority, tags={"module": key})
 
     def extras(after: str) -> None:
         for e in strategy.extra_slides:
@@ -553,9 +668,10 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
             if any(similar_titles(e.title, it.title) for it in items):
                 continue
             if e.layout in ("card_grid", "table") and len(strategy.buckets) >= 2 and re.search(
-                r"bucket|pillar|segment|content (mix|plan)", f"{e.title} {e.brief}", re.IGNORECASE
+                r"bucket|pillar|segment|content (mix|plan)|persona|competitor|calendar|creator mix", f"{e.title} {e.brief}",
+                re.IGNORECASE,
             ):
-                logger.info("Extra slide %r repeats the bucket overview; skipped", e.title)
+                logger.info("Extra slide %r repeats a skeleton/module slide; skipped", e.title)
                 continue
             # Execution slides (tables, chips) belong with the plan, not before the strategy.
             section = "plan" if e.layout in _EXECUTION_LAYOUTS else after
@@ -563,17 +679,24 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
 
     add("cover", strategy.title, f"Cover. Subtitle frames the promise to {brand}; tagline = the big idea hook ({big.hook}).",
         "context", required=True)
-    if scale != "focused":
+    if "why_now" in modules:
+        add("statement", "Why now",
+            f"Why now: {strategy.why_now or strategy.moment}. Headline = the moment as a provocation; body = what it "
+            "means for the brand; bullets = 2-4 sourced stats/facts from the DOSSIER (ids in sources).",
+            "context", priority=6, tags={"module": "why_now"})
+    elif scale != "focused":
         add("statement", f"Where {brand} is today",
-            f"Context / why now: {brand}'s position and the moment ({strategy.moment or 'from research'}). Research facts only.",
-            "context", priority=3)
+            f"Context / why now: {brand}'s position and the moment ({strategy.moment or 'from research'}). DOSSIER facts only; "
+            "bullets = sourced stats.", "context", priority=3)
+    module("competitor_scan", 4)
     extras("context")
     add("statement", "Tension point",
         f"TENSION POINT: {strategy.tension}. Headline = the tension as a punchy line; strip starts with 'TENSION POINT:'; "
-        "body = why it matters now.", "tension", priority=6)
+        "body = why it matters now; bullets = the facts behind it.", "tension", priority=6)
     if scale == "flagship" or (scale == "standard" and strategy.insight):
         add("statement", "The insight", f"The human insight: {strategy.insight}. Headline = the truth in internet words.",
             "tension", priority=2)
+    module("personas", 4)
     add("from_to", "Our objective", f"Objective. From: {strategy.from_text} -> To: {strategy.to_text}. Strip = the shift in one line.",
         "tension", priority=3 if scale == "focused" else 6)
     extras("tension")
@@ -581,7 +704,7 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
         add("divider", "The big idea", f"Divider into the big idea; subtitle teases {big.name}.", "idea", priority=1)
     add("statement", big.name or "The big idea",
         f"THE BIG IDEA: {big.name}. Hook: {big.hook}. {big.idea} Headline = idea name or hook; strip = the idea in one line; "
-        "body = how it lives in Indian internet culture.", "idea", required=True)
+        "body = how it lives in Indian internet culture; bullets = 3 reasons it works for the brand.", "idea", required=True)
     extras("idea")
 
     buckets = strategy.buckets
@@ -593,11 +716,17 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
             add("table", "Content buckets at a glance", "Table, one row per bucket: Bucket | Format | Hook | Goal.",
                 "buckets", priority=3)
     for bi, bucket in enumerate(buckets):
+        powered = plan.for_bucket(bucket.name) if plan else None
+        svc_note = (
+            f" Powered by {', '.join(powered.services)}" + (f" ({powered.mechanics})" if powered.mechanics else "") + "."
+            if powered and powered.services else ""
+        )
         for j, layout in enumerate(bucket.slides):
             if layout == "idea":
                 title, brief = bucket.name, (
-                    f"Idea slide for bucket '{bucket.name}': concept note, quoted hook, format, creator archetype + tier, "
-                    "scalability, visual (ref with a search query, or a mock)."
+                    f"Idea slide for bucket '{bucket.name}': concept note naming a real product/campaign/insight, hook, "
+                    "format, creator archetype + tier, scalability, 3-5 execution steps, 2-3 sample posts, services + "
+                    f"service_mechanics, visual.{svc_note}"
                 )
             elif layout == "samples":
                 kind = "meme visuals (template id + exactly its box count)" if has_memes else "mock visuals"
@@ -613,6 +742,7 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
             # The first bucket's samples/ref outrank later buckets' extras when a deck must be trimmed.
             add(layout, title, brief, "buckets", priority=7 if j == 0 else (5 if bi == 0 else 4) - (j - 1), bucket=bi)
     extras("buckets")
+    module("sample_scripts", 3)
 
     if strategy.hacks and scale != "focused":
         if scale == "flagship":
@@ -626,13 +756,27 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
         add("chips", "Distribution science",
             "Chip groups: label = handle category, chips = what they post for us (buckets/formats).", "plan",
             priority=5)
+    module("creator_mix", 3)
+    # WLDD services, woven in: offer table, how they connect, lead-service deep dives, services x phases.
+    add("table", "What we can offer", "Services table (built from the service plan).", "plan", required=True, prebuilt=True,
+        tags={"service": "offer"})
+    if plan and scale != "focused":
+        if len(plan.services) >= 2:
+            add("timeline", "How it all connects", "", "plan", priority=5, prebuilt=True, tags={"service": "ecosystem"})
+        for f in (f for f in plan.services if f.lead):
+            add("statement", f"Why {f.name.split('(')[0].strip()} for {brand}", "", "plan", priority=5, prebuilt=True,
+                tags={"service": "dive_why", "name": f.name})
+            add("timeline", f"How {f.name.split('(')[0].strip()} works for {brand}", "", "plan", priority=4, prebuilt=True,
+                tags={"service": "dive_how", "name": f.name})
+        if len(plan.services) >= 2 and len(strategy.phases) >= 2:
+            add("table", "Who does what, when", "", "plan", priority=4, prebuilt=True, tags={"service": "matrix"})
     add("timeline", "How it rolls out",
         "Timeline of the phases with their timing (" + "; ".join(f"{p.name} {p.when}" for p in strategy.phases) + ").",
         "plan", priority=6)
-    add("table", "What we can offer", "Services table (built from the strategy).", "plan", required=True, prebuilt=True)
+    module("content_calendar", 3)
     add("kpi_table", "How we'll measure success",
-        "KPI table: KPI | Target | How we measure" + (" (monthly targets: Month 1 / Month 3 / Month 6)" if scale == "flagship" else "")
-        + ". Targets read as targets.", "plan", required=True)
+        "KPI table: KPI | Target | How we measure. Targets read as targets.", "plan", required=True)
+    module("projections", 3)
     if scale != "focused":
         add("card_grid", "Next steps", f"3 cards: what happens in the first two weeks after {brand} says yes.", "plan",
             priority=3, tags={"next_steps": True})
@@ -651,26 +795,35 @@ def build_slide_plan(strategy: Strategy, profile: ScaleProfile, brand: str, has_
 
 _EXECUTION_LAYOUTS = ("table", "chips", "timeline", "kpi_table")
 _SECTION_RANK = {s: k for k, s in enumerate(SECTIONS)}
+_SERVICE_SUB = {"offer": 2.0, "ecosystem": 2.2, "dive_why": 2.4, "dive_how": 2.4, "matrix": 2.6}
 
 
-def _story_rank(item: PlanItem) -> tuple[int, int]:
-    """Story arc: cover, context, tension, insight/formula, From->To, big idea, buckets, hacks,
-    distribution, services, timeline, KPIs, next steps, (other routes), fin. Stable within a step."""
+def _story_rank(item: PlanItem) -> tuple[int, float]:
+    """Story arc: cover, context/why now, competitor scan, tension, insight, personas, From->To, big idea,
+    buckets, sample scripts, hacks, distribution, creator mix, services (offer, ecosystem, deep dives,
+    matrix), timeline, content calendar, KPIs, projections, next steps, (other routes), fin.
+    Stable within a step."""
     if item.layout == "cover":
         return (-1, 0)
     if item.layout == "fin":
         return (99, 0)
     section = _SECTION_RANK.get(item.section, 0)
-    sub = 0
-    if item.section == "tension":
-        sub = {"from_to": 3}.get(item.layout, 0 if item.title == "Tension point" else 1)
+    key = item.tags.get("module")
+    if key in MODULES:
+        return (section, MODULES[key][2])
+    sub: float = 0
+    if item.section == "context":
+        sub = 1 if item.tags.get("extra") else 0
+    elif item.section == "tension":
+        sub = {"from_to": 3}.get(item.layout, 0 if item.title == "Tension point" else (1 if item.title == "The insight" else 1.8))
     elif item.section == "plan":
-        if item.layout == "chips":
+        kind = item.tags.get("service")
+        if kind in _SERVICE_SUB:
+            sub = _SERVICE_SUB[kind]
+        elif item.layout == "chips":
             sub = 0
         elif item.tags.get("extra"):
             sub = 1
-        elif item.prebuilt:
-            sub = 2
         elif item.layout == "timeline":
             sub = 3
         elif item.layout == "kpi_table":
@@ -684,9 +837,14 @@ def _story_rank(item: PlanItem) -> tuple[int, int]:
     return (section, sub)
 
 
+def _rendered(items: list[PlanItem]) -> int:
+    """Slides as rendered: an idea with sample posts becomes a concept page + a how-we-run-it page."""
+    return len(items) + sum(1 for it in items if it.layout == "idea")
+
+
 def _fit_plan(items: list[PlanItem], profile: ScaleProfile, strategy: Strategy, brand: str) -> list[PlanItem]:
     # Too long: drop the lowest-priority optional slides (later ones first).
-    while len(items) > profile.max_slides:
+    while _rendered(items) > profile.max_slides:
         optional = [(it.priority, -idx) for idx, it in enumerate(items) if not it.required]
         if not optional:
             break
@@ -714,7 +872,7 @@ def _fit_plan(items: list[PlanItem], profile: ScaleProfile, strategy: Strategy, 
     fillers.append((None, PlanItem(0, "two_column", f"Why this works for {brand}",
                                    "Left: what the audience gets; right: what the brand gets.", "plan", priority=1)))
     for bi, filler in fillers:
-        if len(items) >= profile.min_slides:
+        if _rendered(items) >= profile.min_slides:
             break
         if bi is not None:
             insert_after_bucket(bi, filler)
@@ -724,22 +882,36 @@ def _fit_plan(items: list[PlanItem], profile: ScaleProfile, strategy: Strategy, 
     return items
 
 
-def _assign_groups(items: list[PlanItem], n_groups: int) -> int:
-    writable = [it for it in items if not it.prebuilt]
-    n_groups = max(1, min(n_groups, len(writable)))
-    total = sum(LAYOUT_WEIGHT.get(it.layout, 200) for it in writable)
-    target = total / n_groups
-    group, acc = 0, 0.0
-    for it in writable:
-        weight = LAYOUT_WEIGHT.get(it.layout, 200)
-        if acc >= target * (group + 1) - weight / 2 and group < n_groups - 1:
-            group += 1
-        it.group = group
-        acc += weight
+def _unit(item: PlanItem) -> str:
+    """Writer unit: the narrative, one per content bucket, the hacks, the plan."""
+    if item.bucket is not None:
+        return f"bucket{item.bucket}"
+    if item.section in ("context", "tension", "idea") or (item.section == "buckets" and not item.tags.get("module")):
+        return "narrative"
+    if item.section in ("hacks", "buckets"):
+        return "hacks"
+    return "plan"
+
+
+def _assign_groups(items: list[PlanItem], out_cap: int) -> int:
+    """One writer call per unit (narrative, each bucket, hacks, plan); a unit whose slides would not fit
+    one call's output budget is split into contiguous parts. Returns the number of groups."""
+    budget = max(800, int((out_cap - 300) / 1.35))
+    group = -1
+    current_unit, acc = None, 0
     for it in items:
         if it.prebuilt:
             it.group = -1
-    return n_groups
+            continue
+        unit = _unit(it)
+        weight = LAYOUT_WEIGHT.get(it.layout, 250)
+        if unit != current_unit or acc + weight > budget:
+            group += 1
+            current_unit, acc = unit, 0
+        it.group = group
+        it.tags["unit"] = unit
+        acc += weight
+    return group + 1
 
 
 # =========================================================================== writers
@@ -772,19 +944,20 @@ def _strategy_for_group(strategy: Strategy, group_items: list[PlanItem]) -> str:
     own = {it.bucket for it in group_items if it.bucket is not None}
     sections = {it.section for it in group_items}
     layouts = {it.layout for it in group_items}
+    units = {it.tags.get("unit") for it in group_items}
     big = strategy.big_idea
     data: dict[str, Any] = {
         "title": strategy.title, "moment": strategy.moment, "audience": strategy.audience,
         "tension": strategy.tension, "insight": strategy.insight,
-        "from": strategy.from_text, "to": strategy.to_text,
         "big_idea": big.model_dump(),
         "buckets": [
-            b.model_dump() if bi in own or (len(strategy.buckets) <= 3 and "buckets" in sections)
+            b.model_dump(exclude={"visual"} if bi not in own else set()) if bi in own or (len(strategy.buckets) <= 3 and "buckets" in sections)
             else {"name": b.name, "hook": b.hook, "format": b.format}
             for bi, b in enumerate(strategy.buckets)
         ],
-        "services": [p.name for p in strategy.services],
     }
+    if "narrative" in units:
+        data.update({"why_now": strategy.why_now, "from": strategy.from_text, "to": strategy.to_text})
     if "hacks" in sections or "plan" in sections:
         data["hacks"] = [h.model_dump() for h in strategy.hacks]
     if "plan" in sections:
@@ -796,8 +969,51 @@ def _strategy_for_group(strategy: Strategy, group_items: list[PlanItem]) -> str:
     return _dumps(data)
 
 
+def _services_block(inputs: Inputs, strategy: Strategy, mine: list[PlanItem]) -> str:
+    """Bucket calls: the services powering THIS idea, with WLDD's playbook mechanics. Others: the combo."""
+    plan = inputs.service_plan
+    if plan is None:
+        return "WLDD SERVICES IN THIS PITCH: " + ", ".join(p.name for p in strategy.services)
+    buckets = sorted({it.bucket for it in mine if it.bucket is not None})
+    if buckets and any(it.layout == "idea" for it in mine):
+        lines = []
+        catalog = {s.name: s for s in inputs.services}
+        for bi in buckets:
+            bs = plan.for_bucket(strategy.buckets[bi].name)
+            if not bs:
+                continue
+            lines.append(f"Bucket '{strategy.buckets[bi].name}': services {bs.services}; mechanics: {bs.mechanics or 'decide volumes'}")
+            for n in bs.services:
+                fit = next((f for f in plan.services if f.name == n), None)
+                lines.append(render_playbooks([catalog[n]], inputs.playbooks, compact=True) if n in catalog else f"### {n}")
+                if fit:
+                    lines.append(f"for this brand: {strip_fact_ids(fit.what)}; volumes: {fit.volumes}; KPI: {fit.kpi}")
+        return "SERVICES FOR THIS IDEA (fill \"services\" with these exact names and \"service_mechanics\")\n" + "\n".join(lines)
+    combo = " -> ".join(f"{c.service}" for c in plan.combo)
+    return f"WLDD SERVICES IN THIS PITCH: {', '.join(plan.names)}. How they combine: {plan.combo_summary or combo}"
+
+
+def _dossier_block(inputs: Inputs, strategy: Strategy, mine: list[PlanItem], rich: bool) -> str:
+    if not inputs.dossier or not (inputs.dossier.facts or inputs.dossier.products):
+        return ""
+    units = {it.tags.get("unit") for it in mine}
+    if "narrative" in units:
+        return "DOSSIER (cite fact ids in \"sources\")\n" + render_dossier(inputs.dossier, 9000 if rich else 3200)
+    about = [it.title for it in mine]
+    for it in mine:
+        if it.bucket is not None:
+            b = strategy.buckets[it.bucket]
+            about += [b.name, b.concept, b.hook, b.format]
+    if "plan" in units:
+        about += [p.name for p in strategy.phases] + [k.metric for k in strategy.kpis] + ["creators", "followers", "views"]
+    return "DOSSIER SLICE (cite fact ids in \"sources\")\n" + dossier_slice(
+        inputs.dossier, " ".join(about), 5000 if rich else 1900, 10 if rich else 6,
+    )
+
+
 def _writer_messages(
     inputs: Inputs, strategy: Strategy, items: list[PlanItem], group: int, excerpts: list[CraftExcerpt], excerpt_chars: int,
+    rich: bool = False,
 ) -> list:
     mine = [it for it in items if it.group == group]
     others = [it for it in items if it.group != group]
@@ -805,17 +1021,15 @@ def _writer_messages(
     system = WRITER_SYSTEM.format(
         brand=inputs.brand, today=inputs.today, style=STYLE_GUIDE, layouts=LAYOUT_SPEC.replace("{brand}", inputs.brand), rules=rules,
     )
-    services = {s.name: s for s in inputs.services}
-    svc_lines = "\n".join(
-        f"- {p.name}: {clip_text(services[p.name].description, 260)}" for p in strategy.services if p.name in services
-    )
     needs_memes = any(it.layout in ("samples", "idea", "card_grid") for it in mine)
     parts = [
         f"BRAND: {inputs.brand}",
         f"CLIENT BRIEF: {inputs.brief or 'none'}",
         f"STRATEGY\n{_strategy_for_group(strategy, mine)}",
-        f"WLDD SERVICES IN THIS PITCH\n{svc_lines}",
+        _services_block(inputs, strategy, mine),
     ]
+    if dossier := _dossier_block(inputs, strategy, mine, rich):
+        parts.append(dossier)
     if inputs.identity and inputs.identity.products:
         parts.append(
             "BRAND PRODUCTS (name at least two of these where natural, spelled exactly): "
@@ -831,7 +1045,7 @@ def _writer_messages(
     if needs_memes:
         parts.append(
             "MEME TEMPLATES (id | name | boxes): use ONLY these ids, each at most once, with exactly its number of boxes\n"
-            + _fmt_memes(inputs.memes, 15)
+            + _fmt_memes(inputs.memes, 15 if rich else 10)
         )
     if excerpts:
         shown = "\n---\n".join(clip_text(_scrub(e.text, inputs), excerpt_chars) for e in excerpts)
@@ -840,7 +1054,7 @@ def _writer_messages(
             f"shows, creators or ideas)\n---\n{shown}\n---"
         )
     if others:
-        parts.append("OTHER WRITERS' SLIDES (don't repeat them)\n" + "\n".join(f"{it.i}. {it.layout}: {it.title}" for it in others))
+        parts.append("OTHER WRITERS' SLIDES (don't repeat them): " + "; ".join(f"{it.i} {clip_text(it.title, 38)}" for it in others))
     parts.append(
         "YOUR SLIDES (write each one; keep i and layout; the title is a hint, write a better headline)\n"
         + "\n".join(f"{it.i}. {it.layout} | {it.title} | {it.brief}" for it in mine)
@@ -895,6 +1109,27 @@ def _fix_visual(v: dict[str, Any] | None, memes: dict[str, visuals.MemeTemplate]
     return v
 
 
+def _str_items(value: Any) -> list[str]:
+    """Lists of strings from what models write: objects -> 'name: detail', nested lists flattened."""
+    if value is None:
+        return []
+    if isinstance(value, (str, dict)):
+        value = [value]
+    out: list[str] = []
+    for v in value if isinstance(value, list) else []:
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, dict):
+            vals = [str(x) for x in v.values() if isinstance(x, (str, int, float)) and str(x).strip()]
+            if vals:
+                out.append(": ".join(vals[:2]) if len(vals) > 1 else vals[0])
+        elif isinstance(v, (int, float)):
+            out.append(str(v))
+        elif isinstance(v, list):
+            out.extend(_str_items(v))
+    return out
+
+
 def _prepare_slide(raw: dict[str, Any], item: PlanItem | None, memes: dict[str, visuals.MemeTemplate]) -> dict[str, Any]:
     data = dict(raw)
     data.pop("i", None)
@@ -903,6 +1138,13 @@ def _prepare_slide(raw: dict[str, Any], item: PlanItem | None, memes: dict[str, 
     layout = data.get("layout")
     if not data.get("title") and item is not None:
         data["title"] = item.title
+    for key in ("execution", "sample_posts", "bullets", "services", "sources"):
+        if key in data:
+            data[key] = _str_items(data[key])
+    if isinstance(data.get("service_mechanics"), (dict, list)):
+        sm = data["service_mechanics"]
+        data["service_mechanics"] = "; ".join(
+            f"{k}: {v}" for k, v in sm.items()) if isinstance(sm, dict) else "; ".join(_str_items(sm))
     if layout == "idea" and not data.get("concept_note"):
         for alias in ("concept", "concept note", "conceptNote", "description", "body", "idea"):
             if isinstance(data.get(alias), str) and data[alias].strip():
@@ -1004,15 +1246,19 @@ async def _write_group(
     inputs: Inputs, strategy: Strategy, items: list[PlanItem], group: int, excerpts: list[CraftExcerpt], excerpt_chars: int,
     out_cap: int,
     shift: int = 0,
+    rich: bool = False,
+    sem: asyncio.Semaphore | None = None,
 ) -> dict[int, Any]:
     mine = [it for it in items if it.group == group]
-    messages = _writer_messages(inputs, strategy, items, group, excerpts, excerpt_chars)
-    weight = sum(LAYOUT_WEIGHT.get(it.layout, 200) for it in mine)
+    messages = _writer_messages(inputs, strategy, items, group, excerpts, excerpt_chars, rich)
+    weight = sum(LAYOUT_WEIGHT.get(it.layout, 250) for it in mine)
     max_tokens = int(min(max(weight * 1.35 + 300, 1200), out_cap))
     try:
-        result = await llm_router.invoke_json(
-            "writer", messages, WriterOutput, max_tokens=max_tokens, temperature=0.85, prefer=group + shift,
-        )
+        async with sem or contextlib.nullcontext():
+            result = await llm_router.invoke_json(
+                "writer", messages, WriterOutput, max_tokens=max_tokens, temperature=0.85, prefer=group + shift,
+                max_wait=_WRITER_MAX_WAIT, min_output=min(max_tokens, int(weight * 1.2)),
+            )
         raws = result.slides
     except llm_router.LLMOutputError as exc:
         # Keep every complete slide object from the broken answer.
@@ -1022,7 +1268,8 @@ async def _write_group(
         logger.warning("Writer group %d: invalid JSON, salvaged %d complete slides", group, len(raws))
     slides = _parse_slides(raws, mine, inputs.meme_ids, f"writer group {group}")
     missing = [it.i for it in mine if it.i not in slides]
-    logger.info("Writer group %d: %d/%d slides valid%s", group, len(slides), len(mine), f", missing {missing}" if missing else "")
+    logger.info("Writer group %d (%s): %d/%d slides valid%s", group, mine[0].tags.get("unit") if mine else "-",
+                len(slides), len(mine), f", missing {missing}" if missing else "")
     return slides
 
 
@@ -1032,13 +1279,10 @@ async def _run_writers(inputs: Inputs, strategy: Strategy, items: list[PlanItem]
         min(llm_router.prompt_capacity("writer", _WRITER_PROMPT_BUDGET), llm_router.output_capacity("writer"), _WRITER_MAX_OUTPUT),
     )
     rich = out_cap >= _WRITER_MAX_OUTPUT
-    total = sum(LAYOUT_WEIGHT.get(it.layout, 200) for it in items if not it.prebuilt)
-    # More groups than the profile when one group's output would not fit a single request.
-    n_groups = max(profile.writer_groups, math.ceil(total * 1.35 / max(out_cap - 300, 800)))
-    n_groups = _assign_groups(items, n_groups)
+    n_groups = _assign_groups(items, out_cap)
     groups = list(range(n_groups))
 
-    n_excerpts, excerpt_chars = (4, 900) if rich else (3, 420)
+    n_excerpts, excerpt_chars = (3, 900) if rich else (2, 380)
     excerpt_lists = await asyncio.gather(
         *(_craft_for_group(inputs, strategy, [it for it in items if it.group == g], n_excerpts) for g in groups)
     )
@@ -1046,14 +1290,27 @@ async def _run_writers(inputs: Inputs, strategy: Strategy, items: list[PlanItem]
         for e in exs:
             _register_shown(inputs, e.pitch_id, e.client, e.campaign, e.text)
     _refresh_banned(inputs)
-    logger.info("Writers: %d groups (profile %d), output cap %d tokens, weights %s", n_groups, profile.writer_groups, out_cap,
-                [sum(LAYOUT_WEIGHT.get(it.layout, 200) for it in items if it.group == g) for g in groups])
+    # Calls queue in order; at most this many hold a model at once (they still pick models by budget).
+    sem = asyncio.Semaphore(max(2, len(llm_router.role_models("writer"))))
+    logger.info(
+        "Writers: %d calls (units %s), output cap %d tokens, weights %s", n_groups,
+        [next((it.tags.get("unit") for it in items if it.group == g), "-") for g in groups], out_cap,
+        [sum(LAYOUT_WEIGHT.get(it.layout, 250) for it in items if it.group == g) for g in groups],
+    )
 
     t = time.monotonic()
-    results = await asyncio.gather(
-        *(_write_group(inputs, strategy, items, g, excerpt_lists[g], excerpt_chars, out_cap) for g in groups),
-        return_exceptions=True,
-    )
+    done_count = 0
+
+    async def one(g: int, shift: int = 0, pool: list[PlanItem] = items) -> dict[int, Any]:
+        nonlocal done_count
+        try:
+            return await _write_group(inputs, strategy, pool, g, excerpt_lists[g], excerpt_chars, out_cap, shift, rich, sem)
+        finally:
+            done_count += 1
+            lo, hi = STAGE_PROGRESS["writing"], STAGE_PROGRESS["editing"]
+            await inputs.stage("writing", lo + (hi - lo) * min(1.0, done_count / max(1, n_groups)))
+
+    results = await asyncio.gather(*(one(g) for g in groups), return_exceptions=True)
     slides: dict[int, Any] = {}
     errors: list[BaseException] = []
     for g, res in zip(groups, results):
@@ -1071,11 +1328,7 @@ async def _run_writers(inputs: Inputs, strategy: Strategy, items: list[PlanItem]
         retry_items = [
             PlanItem(**{**it.__dict__, "group": (it.group if it in missing else -2)}) for it in items
         ]
-        again = await asyncio.gather(
-            *(_write_group(inputs, strategy, retry_items, g, excerpt_lists[g], excerpt_chars, out_cap, shift=1)
-              for g in retry_groups),
-            return_exceptions=True,
-        )
+        again = await asyncio.gather(*(one(g, 1, retry_items) for g in retry_groups), return_exceptions=True)
         for g, res in zip(retry_groups, again):
             if isinstance(res, BaseException):
                 logger.error("Writer group %d failed again: %s: %s", g, type(res).__name__, str(res)[:200])
@@ -1102,6 +1355,28 @@ def _services_slide(strategy: Strategy, brand: str) -> TableSlide:
         rows=[[p.name, p.why or "-", p.what or "-"] for p in strategy.services],
         notes="Exact scope and volumes get locked with your team after the brief call.",
     )
+
+
+def _prebuilt_slide(item: PlanItem, inputs: Inputs, strategy: Strategy) -> Any | None:
+    """Service slides built in code from the service plan (exact names, no writer needed)."""
+    plan, brand = inputs.service_plan, inputs.brand
+    kind = item.tags.get("service", "offer")
+    if plan is None:
+        return _services_slide(strategy, brand) if kind == "offer" else None
+    if kind == "offer":
+        return offer_table(plan, brand, strategy.big_idea.name, inputs.dossier)
+    if kind == "ecosystem":
+        return ecosystem_slide(plan, brand)
+    if kind == "matrix":
+        return matrix_slide(plan, strategy)
+    if kind in ("dive_why", "dive_how"):
+        lead = next((f for f in plan.services if f.name == item.tags.get("name")), None)
+        if lead is None:
+            return None
+        single = ServicePlan(services=[lead.model_copy(update={"lead": True})])
+        why, how = deep_dive_slides(single, brand, inputs.dossier)
+        return why if kind == "dive_why" else how
+    return None
 
 
 def _fallback_slide(item: PlanItem, strategy: Strategy, brand: str) -> Any | None:
@@ -1217,10 +1492,15 @@ def _editor_messages(
     )
     others = [i for i in range(len(slides)) if i not in idxs]
     must = [f"- slide {i}: " + "; ".join(issues[i]) for i in idxs if i in issues]
+    names = _specific_names(inputs)
     parts = [
         f"BIG IDEA: {strategy.big_idea.name} ({strategy.big_idea.hook}). Buckets: "
         + ", ".join(b.name for b in strategy.buckets),
     ]
+    if names:
+        parts.append("SPECIFIC NAMES (real products, campaigns, competitors of the brand's world): " + ", ".join(names[:20]))
+    if inputs.service_plan:
+        parts.append("SERVICES IN THIS PITCH (exact): " + ", ".join(inputs.service_plan.names))
     if others:
         parts.append("OTHER SLIDES (edited separately; avoid repeating them): " + "; ".join(f"{i}. {slides[i].title}" for i in others))
     if must:
@@ -1231,17 +1511,39 @@ def _editor_messages(
 
 
 def _restore_visuals(new: Any, old: Any) -> Any:
-    """Editors sometimes drop visual requests; put the writer's back."""
+    """Editors sometimes drop visual requests or rich fields; put the writer's back."""
     if hasattr(old, "visual") and getattr(old, "visual", None) and not getattr(new, "visual", None):
         new.visual = old.visual
     if hasattr(old, "visuals") and old.visuals and len(getattr(new, "visuals", []) or []) < len(old.visuals):
         new.visuals = old.visuals
+    for key in ("execution", "sample_posts", "services", "service_mechanics", "bullets", "sources"):
+        if getattr(old, key, None) and not getattr(new, key, None):
+            setattr(new, key, getattr(old, key))
     return new
 
 
-async def _edit_chunk(inputs: Inputs, strategy: Strategy, slides: list[Any], idxs: list[int], issues, prefer: int, max_tokens: int):
+def _specific_names(inputs: Inputs) -> list[str]:
+    extra = list(inputs.identity.products) if inputs.identity and inputs.identity.products else []
+    return specific_terms(inputs.dossier, extra)
+
+
+def _specificity_issues(slides: list[Any], inputs: Inputs) -> dict[int, list[str]]:
+    """Idea slides that name no real product, campaign or competitor from the dossier/identity."""
+    names = _specific_names(inputs)
+    if not names:
+        return {}
+    out: dict[int, list[str]] = {}
+    for i, s in enumerate(slides):
+        if isinstance(s, IdeaSlide) and not mentions_any(slide_text(s) + " " + s.notes, names):
+            out[i] = [f"generic: name a real product, campaign or audience insight (e.g. {', '.join(names[:4])})"]
+    return out
+
+
+async def _edit_chunk(inputs: Inputs, strategy: Strategy, slides: list[Any], idxs: list[int], issues, prefer: int,
+                      max_tokens: int, max_wait: float | None = None):
     messages = _editor_messages(inputs, strategy, slides, idxs, issues)
-    result = await llm_router.invoke_json("editor", messages, EditorOutput, max_tokens=max_tokens, temperature=0.4, prefer=prefer)
+    result = await llm_router.invoke_json("editor", messages, EditorOutput, max_tokens=max_tokens, temperature=0.4,
+                                          prefer=prefer, max_wait=max_wait)
     edits: dict[int, Any] = {}
     allowed = set(idxs)
     for edit in result.edits:
@@ -1269,8 +1571,13 @@ async def _edit_chunk(inputs: Inputs, strategy: Strategy, slides: list[Any], idx
     return edits
 
 
-async def _run_editor(inputs: Inputs, strategy: Strategy, slides: list[Any], items_group: list[int]) -> list[Any]:
+async def _run_editor(
+    inputs: Inputs, strategy: Strategy, slides: list[Any], items_group: list[int], skip: set[int] | None = None,
+) -> list[Any]:
     issues = find_issues(slides, inputs.banned, inputs.research_text)
+    for i, msgs in _specificity_issues(slides, inputs).items():
+        issues.setdefault(i, []).extend(msgs)
+    skip = skip or set()
     if issues:
         logger.info("Pre-edit rule issues: %s", {i: v for i, v in issues.items()})
     sizes = [llm_router.estimate_tokens(_dumps(_slide_payload(s))) + 10 for s in slides]
@@ -1281,25 +1588,29 @@ async def _run_editor(inputs: Inputs, strategy: Strategy, slides: list[Any], ite
         logger.warning("No editor model available; keeping the unedited deck")
         return slides
 
+    editable = [i for i in range(len(slides)) if i not in skip]  # prebuilt service slides are exact already
+    total = sum(sizes[i] for i in editable)
+    if total + _EDITOR_SYSTEM_TOKENS > 2.5 * capacity:
+        # Small per-request budget (Groq free tier): edit where it matters most, i.e. flagged slides,
+        # ideas (specificity) and the narrative statements (voice), not every table and chip.
+        focus = [i for i in editable if i in issues or slides[i].layout in ("idea", "statement", "from_to", "cover")]
+        logger.info("Editor: deck ~%d tokens vs capacity %d; editing %d focus slides of %d", total, capacity, len(focus), len(editable))
+        editable = focus
+        total = sum(sizes[i] for i in editable)
     if total + _EDITOR_SYSTEM_TOKENS <= capacity and total <= 9000:
-        chunks = [list(range(len(slides)))]
+        chunks = [editable]
     else:
-        # Chunk along writer groups, splitting further if a group is still too big.
-        budget = max(1200, capacity - _EDITOR_SYSTEM_TOKENS - 400)
-        by_group: dict[int, list[int]] = defaultdict(list)
-        for i, g in enumerate(items_group):
-            by_group[g].append(i)
-        chunks = []
-        for g in sorted(by_group):
-            chunk, size = [], 0
-            for i in by_group[g]:
-                if chunk and size + sizes[i] > budget:
-                    chunks.append(chunk)
-                    chunk, size = [], 0
-                chunk.append(i)
-                size += sizes[i]
-            if chunk:
+        # Pack consecutive slides (deck order keeps related slides together) into chunks that fit one call.
+        budget = max(1200, min(capacity - _EDITOR_SYSTEM_TOKENS - 400, 9000))
+        chunks, chunk, size = [], [], 0
+        for i in editable:
+            if chunk and size + sizes[i] > budget:
                 chunks.append(chunk)
+                chunk, size = [], 0
+            chunk.append(i)
+            size += sizes[i]
+        if chunk:
+            chunks.append(chunk)
     logger.info("Editor: %d chunk(s) %s, deck ~%d tokens, capacity %d", len(chunks), [len(c) for c in chunks], total, capacity)
 
     t = time.monotonic()
@@ -1308,6 +1619,7 @@ async def _run_editor(inputs: Inputs, strategy: Strategy, slides: list[Any], ite
             _edit_chunk(
                 inputs, strategy, slides, chunk, issues, prefer=k,
                 max_tokens=int(min(max(sum(sizes[i] for i in chunk) * 0.9, 1200), 8000)),
+                max_wait=_WRITER_MAX_WAIT,
             )
             for k, chunk in enumerate(chunks)
         ),
@@ -1334,8 +1646,12 @@ def _enforce_services(slides: list[Any], strategy: Strategy, inputs: Inputs, ser
     if services_idx is None:
         return
     slide = slides[services_idx]
+    rebuild = (
+        (lambda: offer_table(inputs.service_plan, inputs.brand, strategy.big_idea.name, inputs.dossier))
+        if inputs.service_plan else (lambda: _services_slide(strategy, inputs.brand))
+    )
     if not isinstance(slide, TableSlide) or slide.layout != "table":
-        slides[services_idx] = _services_slide(strategy, inputs.brand)
+        slides[services_idx] = rebuild()
         return
     rows, seen = [], set()
     for row in slide.rows:
@@ -1345,7 +1661,7 @@ def _enforce_services(slides: list[Any], strategy: Strategy, inputs: Inputs, ser
         seen.add(svc.name)
         rows.append([svc.name, *row[1:]])
     if not rows:
-        slides[services_idx] = _services_slide(strategy, inputs.brand)
+        slides[services_idx] = rebuild()
     else:
         slide.rows = rows
 
@@ -1425,11 +1741,28 @@ def _shift_past_timeline(data: dict, today: date) -> None:
     logger.info("Timeline %r started in the past; shifted forward by %d days", data.get("title"), offset.days)
 
 
+# Banned filler the editor sometimes leaves in: plain replacements.
+_FILLER_FIX = {
+    "leverage": "use", "leverages": "uses", "leveraging": "using", "leveraged": "used", "seamless": "smooth",
+    "seamlessly": "smoothly", "elevate": "lift", "elevates": "lifts", "elevating": "lifting", "synergy": "fit",
+    "holistic": "full", "game-changer": "big shift", "game changer": "big shift", "cutting-edge": "new",
+    "revolutionize": "change", "revolutionise": "change", "delve": "dig",
+}
+_FILLER_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in sorted(_FILLER_FIX, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+def _match_case(src: str, repl: str) -> str:
+    return repl.capitalize() if src[:1].isupper() else repl
+
+
 def _clean_slide(slide: Any, inputs: Inputs) -> Any:
     """Last-line rules in code: no @handles, no unsupported stats (targets excepted), cards with bodies."""
     research = inputs.research_text
     kpi = slide.layout == "kpi_table"
     allow_targets = slide.layout not in NARRATIVE_LAYOUTS
+    facts = facts_by_id(inputs.dossier)
+    cited: list[str] = []  # fact ids found inline or in "sources"
+    stat_facts: list[str] = []  # ids of dossier facts whose figures the slide uses
 
     def fix(value: Any, key: str | None = None) -> Any:
         if isinstance(value, dict):
@@ -1437,22 +1770,44 @@ def _clean_slide(slide: Any, inputs: Inputs) -> Any:
         if isinstance(value, list):
             return [fix(v, key) for v in value]
         if isinstance(value, str) and value:
+            if "[F" in value or "(F" in value:
+                cited.extend(extract_fact_ids(value))
+                value = strip_fact_ids(value)
             out = strip_handles(value) if "@" in value else value
             out = BANNED_PLATFORM_RE.sub("YouTube Shorts", out)
+            out = _FILLER_RE.sub(lambda m: _match_case(m.group(0), _FILLER_FIX[m.group(0).lower()]), out)
             out = re.sub(r"YouTube Shorts(\s*(?:/|,|\+|and|&)\s*(?:YouTube |YT )?Shorts)+", "YouTube Shorts", out, flags=re.IGNORECASE)
             out = re.sub(r"(?:YouTube |YT )?Shorts\s*(?:/|,|\+|and|&)\s*YouTube Shorts", "YouTube Shorts", out, flags=re.IGNORECASE)
+            stats = [m.group(0) for m in PRICE_RE.finditer(out)] if key not in ("query", "brief") else []
             if not kpi and key not in PROPOSAL_KEYS:
-                stats = unsupported_stats(out, research, allow_targets=allow_targets)
-                stats += [m.group(0) for m in PRICE_RE.finditer(out)]
-                if stats:
-                    logger.info("Softened unsupported stat(s) %s on slide %r", stats, slide.title)
-                    out = soften_stats(out, stats)
+                stats += unsupported_stats(out, research, allow_targets=allow_targets)
+            if stats:
+                logger.info("Softened unsupported stat(s)/prices %s on slide %r", stats, slide.title)
+                out = soften_stats(out, stats)
+            if inputs.dossier and key not in PROPOSAL_KEYS:
+                for m in STAT_RE.finditer(out):
+                    if (f := fact_for_stat(m.group(0), inputs.dossier)) is not None:
+                        stat_facts.append(f.id)
             return out
         return value
 
-    data = fix(slide.model_dump())
+    raw = slide.model_dump()
+    given = raw.pop("sources", []) or []
+    data = fix(raw)
+    # Footnotes: cited fact ids + facts behind the figures used -> short labels; labels a model wrote
+    # itself are kept only if they name a dossier source.
+    known_titles = {f.source_title.lower(): source_label(f) for f in facts.values() if f.source_title}
+    known_titles.update({source_label(f).lower(): source_label(f) for f in facts.values()})
+    labels: list[str] = []
+    for ref in [*cited, *(x for g in given for x in (extract_fact_ids(g) or [g])), *stat_facts]:
+        lab = source_label(facts[ref]) if ref in facts else known_titles.get(str(ref).lower())
+        if lab and lab not in labels:
+            labels.append(lab)
+    data["sources"] = labels[:4]
     if isinstance(data.get("hook"), str):
         data["hook"] = data["hook"].strip().strip("\"'\u201c\u201d\u2018\u2019").strip()  # the renderer adds quotes
+    if isinstance(data.get("sample_posts"), list):
+        data["sample_posts"] = [p.strip().strip("\"'\u201c\u201d").strip() for p in data["sample_posts"] if p and p.strip()]
     if slide.layout == "timeline":
         _shift_past_timeline(data, date.today())
     if slide.layout == "card_grid":
@@ -1586,46 +1941,80 @@ def _log_summary(brand: str, scale: str, inputs: Inputs, deck: Deck, records: li
     )
 
 
-async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanScale = "auto") -> BrandPlanResponse:
+async def generate_brand_plan(
+    brand: str, brief: str | None = None, scale: PlanScale = "auto", on_stage: Any = None,
+) -> BrandPlanResponse:
+    """Research -> deep research (dossier) -> strategist -> service planner -> per-unit writers -> editor -> deck.
+
+    ``on_stage(stage, progress)`` (sync or async) is called at the C8 stages: research, identity,
+    deep_research, strategy, writing, editing, visuals, done.
+    """
     started = time.monotonic()
     brief = (brief or "").strip() or None
     with llm_router.track_calls() as records:
-        inputs = await _gather_inputs(brand, brief, scale)
+        inputs = await _gather_inputs(brand, brief, scale, on_stage)
 
+        await inputs.stage("strategy", STAGE_PROGRESS["strategy"])
         strategy = await _run_strategist(inputs)
         resolved = _resolve_scale(inputs, strategy)
         profile = PROFILES[resolved]
         _normalise_strategy(strategy, inputs, profile)
         logger.info(
-            "Strategy for %r: scale=%s (strategist said %r: %s), big idea %r, %d buckets, %d hacks, services %s, theme %s",
+            "Strategy for %r: scale=%s (strategist said %r: %s), big idea %r, %d buckets, %d hacks, first services %s, "
+            "modules %s, theme %s",
             brand, resolved, strategy.scale, strategy.scale_reason, strategy.big_idea.name, len(strategy.buckets),
-            len(strategy.hacks), [p.name for p in strategy.services], strategy.theme.name,
+            len(strategy.hacks), [p.name for p in strategy.services], strategy.modules, strategy.theme.name,
         )
 
-        await _refresh_shortlist(inputs, strategy)
-        items = build_slide_plan(strategy, profile, brand, has_memes=bool(inputs.memes))
+        # Services woven in: a second strategy call decides fit, combo, per-bucket powering and the matrix.
+        t = time.monotonic()
+        dossier_view = render_dossier(inputs.dossier, 5000) if inputs.dossier else ""
+        planned, _ = await asyncio.gather(
+            plan_services(brand, brief, inputs.today, strategy, resolved, inputs.services, inputs.playbooks, dossier_view),
+            _refresh_shortlist(inputs, strategy),
+        )
+        inputs.service_plan = normalise_plan(planned, strategy, inputs.services, resolved)
+        inputs.timings["services"] = time.monotonic() - t
+        sp = inputs.service_plan
+        logger.info(
+            "Service plan for %r: %s; lead %s; combo %s; buckets %s",
+            brand, [(f.name, extract_fact_ids(f.fit_reason)) for f in sp.services], [f.name for f in sp.services if f.lead],
+            " -> ".join(c.service for c in sp.combo), {b.bucket: b.services for b in sp.buckets},
+        )
+
+        items = build_slide_plan(strategy, profile, brand, has_memes=bool(inputs.memes), plan=sp)
+        await inputs.stage("writing", STAGE_PROGRESS["writing"])
         written = await _run_writers(inputs, strategy, items, profile)
 
         slides: list[Any] = []
         groups: list[int] = []
+        bucket_of: dict[int, int | None] = {}
+        prebuilt_idx: set[int] = set()
+        special_idx: set[int] = set()
         services_idx: int | None = None
         last_group = 0
         for item in items:
-            slide = written.get(item.i)
-            if item.prebuilt:
-                slide = _services_slide(strategy, brand)
-            if slide is None:
+            slide = _prebuilt_slide(item, inputs, strategy) if item.prebuilt else written.get(item.i)
+            if slide is None and not item.prebuilt:
                 slide = _fallback_slide(item, strategy, brand)
                 if slide is not None:
                     logger.info("Slide %d (%s) rebuilt from the strategy", item.i, item.layout)
             if slide is None:
-                logger.warning("Slide %d (%s %r) dropped: no valid writer output", item.i, item.layout, item.title)
+                logger.warning("Slide %d (%s %r) dropped: no valid output", item.i, item.layout, item.title)
                 continue
-            if not item.required and _duplicate_of(slide, slides) is not None:
-                logger.info("Slide %d (%s %r) duplicates slide %d; dropped", item.i, slide.layout, slide.title, _duplicate_of(slide, slides))
+            special = item.prebuilt or item.tags.get("module")
+            # Only writer slides are compared with each other (a prebuilt ecosystem timeline is not the rollout).
+            plain = [x for k, x in enumerate(slides) if k not in special_idx]
+            if not item.required and not special and _duplicate_of(slide, plain) is not None:
+                logger.info("Slide %d (%s %r) duplicates an earlier slide; dropped", item.i, slide.layout, slide.title)
                 continue
+            if special:
+                special_idx.add(len(slides))
             if item.prebuilt:
-                services_idx = len(slides)
+                prebuilt_idx.add(len(slides))
+                if item.tags.get("service") == "offer":
+                    services_idx = len(slides)
+            bucket_of[len(slides)] = item.bucket
             slides.append(slide)
             # Prebuilt slides (group -1) are edited with their neighbours.
             last_group = item.group if item.group >= 0 else last_group
@@ -1633,12 +2022,15 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
 
         if len(slides) < max(4, profile.min_slides // 2):
             raise PlanGenerationError(f"only {len(slides)} usable slides were written")
+        enforce_idea_services(slides, bucket_of, sp, strategy, inputs.services)
+        await inputs.stage("editing", STAGE_PROGRESS["editing"])
         try:
-            slides = await _run_editor(inputs, strategy, slides, groups)
+            slides = await _run_editor(inputs, strategy, slides, groups, skip=prebuilt_idx)
         except Exception as exc:  # noqa: BLE001 - the editor is a polish pass
             logger.warning("Editor pass failed (%s: %s); keeping the unedited deck", type(exc).__name__, str(exc)[:200])
 
         _enforce_services(slides, strategy, inputs, services_idx)
+        enforce_idea_services(slides, bucket_of, sp, strategy, inputs.services)
         _fix_all_visuals(slides, inputs.meme_ids)
         slides = [_clean_slide(s, inputs) for s in slides]
         _assign_memes(slides, inputs)
@@ -1657,6 +2049,7 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
             theme = Theme(name=choice.name)
 
         deck = Deck(title=strategy.title, brand=brand, scale=resolved, theme=theme, slides=slides)
+        await inputs.stage("visuals", STAGE_PROGRESS["visuals"])
         t = time.monotonic()
         try:
             deck = await visuals.attach_visuals(deck, profile.visuals)
@@ -1666,6 +2059,7 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
 
         plan = deck_to_markdown(deck)
         _log_summary(brand, resolved, inputs, deck, records, started)
+    await inputs.stage("done", STAGE_PROGRESS["done"])
 
     return BrandPlanResponse(
         brand=brand,
@@ -1675,4 +2069,5 @@ async def generate_brand_plan(brand: str, brief: str | None = None, scale: PlanS
         scale=resolved,
         brief=brief,
         deck=deck,
+        dossier=inputs.dossier,
     )

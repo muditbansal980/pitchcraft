@@ -576,6 +576,8 @@ async def _run(
     json_mode: bool,
     attempt: int = 0,
     exclude: frozenset[str] = frozenset(),
+    max_wait: float | None = None,
+    min_output: int | None = None,
 ) -> _Result:
     models = [m for m in role_models(role, prefer) if m not in exclude] or role_models(role, prefer)
     if not models:
@@ -583,7 +585,7 @@ async def _run(
             f"No LLM is configured for role {role!r} (set GROQ_API_KEY or GOOGLE_API_KEY, check LLM_ROLES)"
         )
     prompt_est = _messages_tokens(messages)
-    deadline = time.monotonic() + MAX_WAIT_SECONDS
+    deadline = time.monotonic() + (max_wait if max_wait is not None else MAX_WAIT_SECONDS)
     failed: set[str] = set()
     last_error: Exception | None = None
 
@@ -599,13 +601,13 @@ async def _run(
                 continue
             per_request = min(budget.tpm, budget.context)
             want = min(max_tokens, budget.per_request_output())
-            if want < max(256, int(max_tokens * _MIN_COMPLETION_SHARE)):
+            if want < (min_output or max(256, int(max_tokens * _MIN_COMPLETION_SHARE))):
                 logger.info("LLM %s skips %s: output cap %d < needed %d", role, model, want, max_tokens)
                 failed.add(model)
                 continue
             room = per_request - prompt_est
             if room < want:
-                if room < max(256, int(want * _MIN_COMPLETION_SHARE)):
+                if room < (min_output or max(256, int(want * _MIN_COMPLETION_SHARE))):
                     logger.info("LLM %s skips %s: prompt ~%d tokens too large (limit %d)", role, model, prompt_est, per_request)
                     failed.add(model)
                     continue
@@ -786,13 +788,15 @@ async def invoke_text(
     max_tokens: int,
     temperature: float = 0.7,
     prefer: int = 0,
+    max_wait: float | None = None,
 ) -> str:
     """Run ``messages`` on the first available model for ``role``; return the text.
 
     ``prefer`` rotates the start of the role's model list, so parallel writer
     groups (prefer=0, 1, 2) land on different models.
     """
-    result = await _run(role, messages, max_tokens=max_tokens, temperature=temperature, prefer=prefer, json_mode=False)
+    result = await _run(role, messages, max_tokens=max_tokens, temperature=temperature, prefer=prefer, json_mode=False,
+                        max_wait=max_wait)
     if result.finish_reason in ("length", "MAX_TOKENS"):
         logger.warning("LLM %s output from %s hit max_tokens=%d and may be cut off", role, result.model, max_tokens)
     return result.text
@@ -806,6 +810,8 @@ async def invoke_json(
     max_tokens: int,
     temperature: float = 0.7,
     prefer: int = 0,
+    max_wait: float | None = None,
+    min_output: int | None = None,
 ) -> T:
     """Like ``invoke_text`` but in JSON mode, validated into ``schema`` (one repair retry).
 
@@ -830,7 +836,8 @@ async def invoke_json(
         try:
             result = await _run(
                 role, msgs, max_tokens=max_tokens, temperature=temperature if not attempt else max(0.3, temperature - 0.2),
-                prefer=prefer + attempt, json_mode=True, attempt=attempt, exclude=frozenset(used),
+                prefer=prefer + attempt, json_mode=True, attempt=attempt, exclude=frozenset(used), max_wait=max_wait,
+                min_output=min_output,
             )
         except _BadOutput as bad:
             used.add(bad.model)

@@ -48,6 +48,13 @@ class Settings(BaseSettings):
             "groq:qwen/qwen3.8-27b",
         ],
         "vision": ["gemini:gemini-3.8-flash"],
+        # Many small parallel calls that condense scraped pages into the brand dossier.
+        "distiller": [
+            "groq:openai/gpt-oss-20b",
+            "gemini:gemini-3.5-flash-lite",
+            "groq:openai/gpt-oss-120b",
+            "groq:qwen/qwen3.8-27b",
+        ],
     }
     # Optional per-model overrides of the router's built-in free-tier limits:
     # {"groq:openai/gpt-oss-120b": {"tpm": 8000, "rpm": 30, "tpd": 200000}}.
@@ -69,6 +76,14 @@ class Settings(BaseSettings):
     pollinations_api_key: str | None = None
     cloudflare_account_id: str | None = None
     cloudflare_api_token: str | None = None
+
+    # Deep research (brand site, blog/newsroom, full articles). Firecrawl works keyless at low
+    # rate limits; a key raises them. Pages that Firecrawl can't serve use httpx + trafilatura.
+    firecrawl_api_key: str | None = None
+    research_pages: dict[str, int] = {"focused": 6, "standard": 10, "flagship": 16}
+    research_cache_hours: int = 24
+    # Built offline from past decks (confidential): keep it next to the vector store, never in git.
+    service_playbooks_path: str = "./chroma_data/service_playbooks.json"
 
     # Downloaded/generated images, served at /media.
     media_dir: str = "./media"

@@ -179,3 +179,44 @@ Need a contract change? Report it to the coordinator instead of editing a file y
 - [x] Agent C — Canva + frontend. **Accepted** (coordinator re-ran: eslint clean, `tsc --noEmit` clean, 12/12 Canva service mock checks, route TestClient checks). Notes: stateless Fernet-encrypted OAuth state; single-use refresh tokens serialised per user; Node fetch has a hard 300 s headers timeout so >290 s requests use `node:http`; callback uses a relative redirect to keep the 127.0.0.1 cookie. Unverified: real Canva OAuth/import (no keys), browser click-through.
 - [x] Integration test (coordinator, real HTTP API on :8004, Groq + Tavily only): signup 201; Thums Up + amp-burst brief → focused 10 slides 36 s; Spotify scale=flagship → 30 slides 180 s (override honoured); Nykaa + Diwali sale brief → standard 22 slides 164 s, season diwali + diyas. All PPTX 200 with attachment headers; no TikTok, no @handles, no watermarks; brand logo/colours/fonts per brand. Found + fixed: timelines starting in the past are shifted forward in code. Skipped (no keys): Gemini, Canva OAuth/import, Reddit OAuth, Imgflip API, AI image generation.
 - [x] PR — https://github.com/muditbansal980/pitchcraft/pull/2
+
+---
+
+# v3 — Deep research + richer decks + services woven in (branch `feature/deep-research`, stacked on v2)
+
+Why: user feedback 2026-10-11. Deck content is thin (compact context: 800-char summaries / 220-char snippets; 3 writer calls for 30+ slides; true stats stripped because research is thin), and WLDD services are a single table row with no link to ideas or explanation of how they combine for the brand. Plan: `/home/mudit/.claude/plans/there-was-a-loophole-curious-lovelace.md`.
+
+## v3 contracts
+
+### C8 — Plan jobs
+- `generate_brand_plan(brand, brief=None, scale="auto", on_stage=None)`; `on_stage(stage: str, progress: float)` (sync or async). Stages in order: `research`, `identity`, `deep_research`, `strategy`, `writing`, `editing`, `visuals`, `done`. Progress 0..1 overall.
+- `POST /api/brand-plan/jobs` body = BrandPlanRequest → `{job_id}`; `GET /api/brand-plan/jobs/{id}` → `{status: queued|running|done|error, stage, progress, result?: BrandPlanResponse, error?: str, status_code?: int}`. Per user, in-memory, ~1 h retention. Sync `POST /api/brand-plan` stays.
+
+### C9 — Deep research + service playbooks
+- `schemas/research.py`: `BrandDossier` (summary, audience, tone_of_voice, products, recent_campaigns, competitors, cultural_hooks, social_signals, moments, `facts: [DossierFact{id, text, number, source_url, source_title}]`, sources, pages_read, depth). `BrandPlanResponse.dossier`.
+- `research_deep.build_dossier(brand, brief, research, identity=None, scale="standard", on_stage=None) -> BrandDossier` (never raises), `research_deep.dossier_text(dossier, max_chars)`.
+- `service_playbooks.ServicePlaybook`, `service_playbooks.load_playbooks() -> {service: playbook}`; built by `uv run python -m app.ingestion.service_playbooks` into `settings.service_playbooks_path` (gitignored — derived from confidential decks).
+- LLM role `distiller` (config `llm_roles`). Settings: `firecrawl_api_key`, `research_pages`, `research_cache_hours`, `service_playbooks_path`.
+
+### C4 (extended) — Deck schema
+- `_Slide.sources: [str]` (footnote labels), `notes` ≤ 2000.
+- `StatementSlide.bullets: [str]` (≤ 4).
+- `IdeaSlide.concept_note` ≤ 700, `execution: [str]` (3–5 steps), `sample_posts: [str]` (2–3), `services: [str]` (exact catalog names powering the idea), `service_mechanics: str`.
+
+## v3 agent assignments (exclusive ownership, no commits by agents)
+
+| Agent | Owns |
+|---|---|
+| D — Deep research + playbooks | `services/research_deep*.py`, `services/service_playbooks.py`, `ingestion/service_playbooks.py` |
+| A — Generation | `services/brand_plan.py`, `services/plan_*.py`, `services/llm_router.py`, `services/retrieval.py`, `api/routes/plan.py` |
+| B — Renderer | `services/deck_render*.py` (+ visuals/themes/media files if needed for new fields) |
+| C — Jobs + frontend | `services/jobs.py`, `api/routes/plan_jobs.py` (new; coordinator wires it in `main.py`), everything in `frontend/` |
+| Coordinator | `schemas/*`, `core/config.py`, `main.py`, `.env.example`, `pyproject.toml`/`uv.lock`, `WORKPLAN.md` |
+
+## v3 progress log
+- [x] Step 0 — branch, contracts C4/C8/C9, settings, `trafilatura`, stubs
+- [x] Agent D — deep research + service playbooks. **Accepted** (dossiers: Nykaa 10 pages/39 facts, Zomato 15/37, Thums Up 7/34, Sleepy Owl 10/27; 10/10 spot-checked numbers exact; 10 playbooks, gitignored, no client/creator names). Keyless Firecrawl is blocked from this machine (403/401) → all pages via fallback scraper/Tavily; Firecrawl path untested until a key is set. Coordinator moved the research cache out of the public /media dir.
+- [x] Agent A — dossier-grounded, per-bucket generation + services woven in. **Accepted** (coordinator: `on_stage` present, imports clean, rendered real v3 Nykaa deck — 25 slides incl. competitor scan, personas, split ideas, 5-col services table, ecosystem, service deep-dive, services×phases, content calendar, monthly KPIs). Real runs: Nykaa 2,895 words vs v2 1,589 (1.8×), 228 vs 121 words/idea, 5 service slides vs 1, 0 TikTok/@handles; Spotify flagship 37 slides 4,800 words, 15 sourced slides. ~6.8 min each on Groq only (over the 5-min target). Post-run fixes offline-verified only.
+- [x] Agent B — renderer for execution/sample posts/services/bullets/footnotes. **Accepted** (coordinator reviewed v3_render_sheet: split concept/run pages, Powered-by chips, post cards, sourced bullets, 5–6 col tables; regression pixel-diff only tables changed). Coordinator tweaks: post cards show the brand name instead of a guessed @handle; table cap raised 6 → 8 columns.
+- [x] Agent C — plan jobs + progress UI + dossier panel. **Accepted** (coordinator re-ran eslint, tsc, 8/8 job tests). Headless-browser run: real stage polling, reload mid-job resumes, dossier panel, Powered-by tiles. Waits on A's `on_stage` for live stages (falls back without it). Jobs are per-process (single uvicorn worker).
+- [x] Integration: v2 vs v3 comparison from A's real runs + coordinator render review (no extra real run: user asked to finish within 15 min) + PR

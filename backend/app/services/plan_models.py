@@ -147,6 +147,8 @@ class Strategy(_Lenient):
     phases: Annotated[list[PhasePlan], _objects("name")] = []
     kpis: Annotated[list[Kpi], _objects("metric")] = []
     season: Str = ""
+    why_now: Str = ""
+    modules: StrList = []
     theme: ThemePick = ThemePick()
     extra_slides: Annotated[list[ExtraSlide], _objects("title")] = []
 
@@ -180,15 +182,40 @@ class ScaleProfile:
 
 PROFILES: dict[str, ScaleProfile] = {
     "focused": ScaleProfile("focused", 6, 10, 1, 1, 2, VisualBudget(ref=2, meme=2, mock=1), 2600, 2),
-    "standard": ScaleProfile("standard", 15, 22, 2, 3, 5, VisualBudget(ref=4, meme=4, mock=3), 3400, 5),
+    # v3: +5 service slides and up to 5 content modules => standard allows up to 26 slides.
+    "standard": ScaleProfile("standard", 15, 26, 2, 3, 5, VisualBudget(ref=4, meme=4, mock=3), 3400, 5),
     "flagship": ScaleProfile("flagship", 30, 45, 3, 5, 8, VisualBudget(ref=8, meme=8, mock=6), 3600, 10),
 }
 
 # Rough output tokens a writer spends per slide of each layout (JSON incl. notes).
+# v3: richer slides (idea = concept + 3-5 execution steps + 2-3 sample posts + services; statements carry bullets).
 LAYOUT_WEIGHT: dict[str, int] = {
-    "cover": 90, "statement": 130, "from_to": 120, "formula": 170, "card_grid": 260, "divider": 70,
-    "idea": 280, "samples": 190, "ref": 170, "two_column": 230, "table": 300, "kpi_table": 280,
-    "chips": 200, "timeline": 260, "fin": 60,
+    "cover": 110, "statement": 260, "from_to": 170, "formula": 220, "card_grid": 380, "divider": 80,
+    "idea": 620, "samples": 230, "ref": 200, "two_column": 330, "table": 450, "kpi_table": 420,
+    "chips": 260, "timeline": 340, "fin": 70,
+}
+
+# Content modules the strategist can add (v3). key -> (layout, section, plan sub-rank, title, brief)
+MODULES: dict[str, tuple[str, str, float, str, str]] = {
+    "why_now": ("statement", "context", 0.5, "Why now",
+                "Why now: the moment and 2-4 sourced stats as bullets; cite fact ids in sources."),
+    "competitor_scan": ("table", "context", 0.8, "The category right now",
+                        "Competitor scan table: Brand | What they do on social | The gap {brand} can own (from DOSSIER competitors)."),
+    "personas": ("card_grid", "tension", 1.5, "Who we are talking to",
+                 "3-4 audience personas as cards: name + one-line life + what they want from {brand} (from DOSSIER audience)."),
+    "sample_scripts": ("two_column", "buckets", 9.0, "Sample scripts",
+                       "Two short creator scripts (hook, beats, CTA) for the strongest buckets, one per column."),
+    "creator_mix": ("table", "plan", 0.5, "The creator mix",
+                    "Creator mix table: Tier | Archetype | Count (target) | Role | Formats."),
+    "content_calendar": ("table", "plan", 3.5, "A week in the feed",
+                         "Content calendar table: Week | Morning | Afternoon | Evening | Late night (what goes live; buckets/formats)."),
+    "projections": ("kpi_table", "plan", 4.5, "Month by month",
+                    "Projection table: Metric | Month 1 | Month 2 | Month 3 (all labelled targets)."),
+}
+DEFAULT_MODULES: dict[str, tuple[str, ...]] = {
+    "focused": ("why_now",),
+    "standard": ("why_now", "competitor_scan", "personas", "creator_mix", "content_calendar"),
+    "flagship": ("why_now", "competitor_scan", "personas", "sample_scripts", "creator_mix", "content_calendar", "projections"),
 }
 
 # Layouts the strategist may pick for buckets / extra slides.
