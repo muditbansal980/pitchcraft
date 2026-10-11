@@ -42,6 +42,7 @@ from tavily import AsyncTavilyClient
 from app.core.config import settings
 from app.services import llm_router
 from app.services.brand_identity_fonts import CATEGORY_PAIRS, clean_family, is_generic, map_fonts
+from app.services.brand_identity_products import find_products, jsonld_names
 from app.services.brand_identity_season import detect_season_detail
 from app.services.media import image_digest, save_image, save_png
 from app.services.visuals_http import BROWSER_UA, fetch_image
@@ -80,6 +81,8 @@ class BrandIdentity(BaseModel):
     logo_url: str | None = Field(None, description="/media/<sha1>.png")
     logo_source: str | None = None
     motifs: list[str] = Field(default_factory=list)
+    products: list[str] = Field(default_factory=list,
+                                description="Concrete products / sub-brands / app features / shows to name in the deck")
     product_images: list[str] = Field(default_factory=list, description="/media URLs of product/hero shots")
     title: str = ""
     description: str = ""
@@ -89,6 +92,7 @@ class BrandIdentity(BaseModel):
     # Raw site text kept so motifs can be recomputed with new research text from the cache.
     site_nav: list[str] = Field(default_factory=list, exclude=True)
     site_headings: list[str] = Field(default_factory=list, exclude=True)
+    site_jsonld: list[str] = Field(default_factory=list, exclude=True)
 
 
 IDENTITY_TTL = 3600.0
@@ -774,6 +778,7 @@ async def _read_site(site: str, client: httpx.AsyncClient, ident: BrandIdentity,
         nav = []
         headings = headings[:6]
     ident.site_nav, ident.site_headings = nav, headings
+    ident.site_jsonld = jsonld_names(page)
     ident.motifs = extract_motifs(ident.brand, nav, headings + [ident.title], ident.description, research_text)
 
 
@@ -825,6 +830,12 @@ def _merge_colors(ident: BrandIdentity, logo_colors: list[tuple[str, float]], ow
     clusters.sort(key=lambda cl: -cl["score"])
     ident.colors = [cl["color"] for cl in clusters[:4]]
     ident.color_sources = {cl["color"]: "+".join(sorted(cl["sources"])) for cl in clusters[:4]}
+
+
+def cached_identity(brand: str) -> BrandIdentity | None:
+    """The identity probed for ``brand`` in the last hour, without any network call."""
+    hit = _cache.get(" ".join((brand or "").split())[:80].lower())
+    return hit[1].model_copy(deep=True) if hit and hit[0] > time.monotonic() else None
 
 
 async def probe_brand_identity(brand: str, research_text: str = "") -> BrandIdentity:
@@ -880,6 +891,12 @@ async def probe_brand_identity(brand: str, research_text: str = "") -> BrandIden
         lp = resolve_media(ident.logo_url)
         own_logo = dominant_image_colors(lp.read_bytes()) if lp else []
     _merge_colors(ident, logo_colors, own_logo)
+    try:
+        ident.products = await asyncio.wait_for(find_products(
+            brand, jsonld=ident.site_jsonld, nav=ident.site_nav, headings=ident.site_headings, title=ident.title,
+            description=ident.description, research_text=research_text), timeout=35)
+    except Exception as exc:  # noqa: BLE001 - products are best-effort
+        logger.info("identity: product lookup failed for %s: %s", brand, exc.__class__.__name__)
 
     brand_fonts = [f for f in ident.raw_fonts if clean_family(f) not in _SYSTEM_FONTS]
     heading, body, how = map_fonts(brand_fonts)  # system-only sites have no brand font to map
@@ -898,6 +915,6 @@ async def probe_brand_identity(brand: str, research_text: str = "") -> BrandIden
     logger.info(
         "identity: %s site=%s colors=%s fonts=%s->%s/%s (%s) logo=%s motifs=%s season=%s %.1fs",
         brand, ident.site_url, ident.colors, ident.raw_fonts[:3], heading, body, how, bool(ident.logo_url),
-        ident.motifs, ident.season, ident.timings["total"],
+        ident.products or ident.motifs, ident.season, ident.timings["total"],
     )
     return ident

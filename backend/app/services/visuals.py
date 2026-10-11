@@ -54,6 +54,7 @@ from app.services import llm_router, trends
 from app.services.media import image_digest, resolve_media, save_image
 from app.services.memes import (  # re-exported: callers import these from visuals
     MemeTemplate,
+    captionable,
     choose_replacement,
     get_meme_templates,
     meme_shortlist,
@@ -62,7 +63,7 @@ from app.services.memes import (  # re-exported: callers import these from visua
     template_image_urls,
 )
 from app.services.memes_layouts import render_meme
-from app.services.visuals_http import FetchedImage, fetch_image, new_client
+from app.services.visuals_http import FetchedImage, fetch_image, new_client, watermarked_url
 from app.services.visuals_safety import is_safe_text
 
 logger = logging.getLogger(__name__)
@@ -124,8 +125,14 @@ def _iter_visuals(node: Any):
             yield from _iter_visuals(item)
 
 
+def _watermarked(v: Visual) -> bool:
+    """Anonymous Pollinations images and stock-library previews carry watermarks: never keep them."""
+    anon_poll = (v.credit or "") == "AI mock (Pollinations)" and not getattr(settings, "pollinations_api_key", None)
+    return anon_poll or watermarked_url(v.source_url, v.credit)
+
+
 def _already_filled(v: Visual) -> bool:
-    return v.kind != "placeholder" and resolve_media(v.url) is not None
+    return v.kind != "placeholder" and resolve_media(v.url) is not None and not _watermarked(v)
 
 
 def _domain(url: str) -> str:
@@ -209,6 +216,11 @@ class _Ctx:
     logged: set[str] = field(default_factory=set)
     motif: str = ""
     season_words: str = ""
+    season_hero_query: str = ""
+    season_photo_query: str = ""
+    shortlist: list[MemeTemplate] = field(default_factory=list)
+    meme_used: set[str] = field(default_factory=set)
+    product_images: list[str] = field(default_factory=list)
 
     def log_once(self, key: str, msg: str, *args: Any) -> None:
         if key not in self.logged:
@@ -292,6 +304,8 @@ async def _ref_candidates(ctx: _Ctx, v: Visual, kind: str = "ref") -> list[_Cand
     searched = sorted(_interleave(tav, red), key=lambda c: -_relevance(brief, c[1]))
     pool, seen = [], set()
     for url, desc, src in [*searched, *_pulse_matches(ctx, query)]:
+        if watermarked_url(url, src):
+            continue  # stock previews are watermarked
         if url not in seen and is_safe_text(desc):
             seen.add(url)
             pool.append((url, desc, src))
@@ -302,6 +316,8 @@ async def _ref_candidates(ctx: _Ctx, v: Visual, kind: str = "ref") -> list[_Cand
     digests: set[str] = set()
     for (url, desc, src), img in zip(pool, fetched, strict=True):
         if not img:
+            continue
+        if watermarked_url(img.url, img.page_url):
             continue
         img = FetchedImage(trim_borders(img.data), img.mime, img.url, img.page_url)
         if not _usable(img.data):
@@ -377,6 +393,32 @@ async def _imgflip_caption(ctx: _Ctx, template_id: str, boxes: list[str]) -> _Ca
                       credit=f"Brand meme, Imgflip template: {name.name if name else template_id}"[:120])
 
 
+async def _caption(ctx: _Ctx, tid: str, boxes: list[str]) -> _Candidate | None:
+    if settings.imgflip_username and settings.imgflip_password:
+        made = await _imgflip_caption(ctx, tid, boxes)
+        if made:
+            return made
+    else:
+        ctx.log_once("imgflip", "visuals: Imgflip credentials missing; captioning templates locally")
+    tpl = ctx.templates.get(tid)
+    if not tpl or not tpl.url:
+        return None
+    img = None
+    for url in template_image_urls(tpl):
+        img = await _download(ctx, url)
+        if img:
+            break
+    if not img:
+        return None
+    try:
+        data = await asyncio.to_thread(render_meme, img.data, tid, boxes, tpl.box_count)
+    except Exception as exc:  # noqa: BLE001 - one bad meme never breaks the deck
+        logger.info("visuals: local meme caption failed: %s", exc)
+        return None
+    return _Candidate(data=data, mime="image/jpeg", kind="meme", source_url=tpl.url,
+                      credit=f"Brand meme, template: {tpl.name}"[:120])
+
+
 async def _meme(ctx: _Ctx, v: Visual) -> list[_Candidate]:
     boxes = [b for b in v.meme_boxes if b and b.strip()]
     tid = (v.meme_template_id or "").strip()
@@ -385,29 +427,22 @@ async def _meme(ctx: _Ctx, v: Visual) -> list[_Candidate]:
         return []
     if not tid or not boxes:
         return await _meme_without_template(ctx, v, boxes)
-    if settings.imgflip_username and settings.imgflip_password:
-        made = await _imgflip_caption(ctx, tid, boxes)
+    tried: set[str] = set()
+    for _attempt in range(3):  # the template, then up to two captionable stand-ins
+        tried.add(tid)
+        made = await _caption(ctx, tid, boxes)
         if made:
+            v.meme_template_id = tid
             return [made]
-    else:
-        ctx.log_once("imgflip", "visuals: Imgflip credentials missing; captioning templates locally")
-    tpl = ctx.templates.get(tid)
-    if not tpl or not tpl.url:
-        return []
-    img = None
-    for url in template_image_urls(tpl):
-        img = await _download(ctx, url)
-        if img:
+        current = ctx.templates.get(tid)
+        repl = choose_replacement(current, current.box_count if current else len(boxes),
+                                  ctx.meme_used | tried, set(), ctx.shortlist, v.brief or "")
+        if repl is None:
             break
-    if not img:
-        return []
-    try:
-        data = await asyncio.to_thread(render_meme, img.data, tid, boxes, tpl.box_count)
-    except Exception as exc:  # noqa: BLE001 - one bad meme never breaks the deck
-        logger.info("visuals: local meme caption failed: %s", exc)
-        return []
-    return [_Candidate(data=data, mime="image/jpeg", kind="meme", source_url=tpl.url,
-                       credit=f"Brand meme, template: {tpl.name}"[:120])]
+        logger.info("visuals: meme template %s failed; retrying with %s (%s)", tid, repl.id, repl.name)
+        ctx.meme_used.add(repl.id)
+        tid = repl.id
+    return []
 
 
 async def _meme_without_template(ctx: _Ctx, v: Visual, boxes: list[str]) -> list[_Candidate]:
@@ -514,7 +549,11 @@ async def _mock(ctx: _Ctx, v: Visual, hero: bool, fallback: bool = True) -> list
     provider = settings.image_gen_provider
     prompt = _mock_prompt(ctx, v, hero)
     data = None
-    if provider != "none" and provider not in ctx.mock_dead and is_safe_text(prompt):
+    if not _generator_ready():
+        # Anonymous Pollinations watermarks its images (and mostly answers 402): never used for client decks.
+        ctx.log_once("nogen", "visuals: no image generator key (POLLINATIONS_API_KEY / Cloudflare); "
+                              "AI mocks fall back to brand and web images")
+    elif provider not in ctx.mock_dead and is_safe_text(prompt):
         async with ctx.sem_gen:
             if provider not in ctx.mock_dead:
                 data = await (_pollinations(ctx, prompt, hero) if provider == "pollinations"
@@ -523,9 +562,79 @@ async def _mock(ctx: _Ctx, v: Visual, hero: bool, fallback: bool = True) -> list
         label = "FLUX schnell" if provider == "cloudflare" else "Pollinations"
         return [_Candidate(data=data, mime="image/jpeg", kind="mock", source_url="",
                            credit=f"AI mock ({label})", caption=v.brief[:200])]
-    if hero or not fallback or not MOCK_FALLBACK_TO_REF:
+    if hero:
+        return await _hero_fallback(ctx, v)
+    if not fallback or not MOCK_FALLBACK_TO_REF:
         return []
     return await _ref_candidates(ctx, v, kind="ref")
+
+
+COMMONS_UA = "PitchCraft/0.2 (pitch deck generator; season photos)"
+
+
+async def _commons_images(ctx: "_Ctx", query: str, limit: int = 6) -> list[_Candidate]:
+    """Freely licensed photos from Wikimedia Commons (no key), credited with author + licence."""
+    try:
+        resp = await ctx.client.get("https://commons.wikimedia.org/w/api.php", params={
+            "action": "query", "generator": "search", "gsrsearch": f"{query} filetype:bitmap", "gsrnamespace": 6,
+            "gsrlimit": 10, "prop": "imageinfo", "iiprop": "url|size|extmetadata", "iiurlwidth": 1600,
+            "format": "json"}, headers={"User-Agent": COMMONS_UA}, timeout=10)
+        pages = (resp.json().get("query") or {}).get("pages") or {}
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.info("visuals: Wikimedia Commons search failed: %s", exc)
+        return []
+    items = []
+    for page in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+        info = (page.get("imageinfo") or [{}])[0]
+        if info.get("width", 0) < 1000 or info.get("width", 0) < 1.15 * info.get("height", 1):
+            continue
+        meta = info.get("extmetadata") or {}
+        artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value") or "").strip()[:40]
+        lic = ((meta.get("LicenseShortName") or {}).get("value") or "").strip()
+        items.append((info.get("thumburl") or info.get("url"), info.get("descriptionurl") or "",
+                      f"Background: {artist or 'Wikimedia Commons'}, {lic or 'CC'} (Wikimedia Commons)"))
+        if len(items) >= limit:
+            break
+    fetched = await asyncio.gather(*(_download(ctx, u) for u, _, _ in items))
+    out = []
+    for (u, page_url, credit), img in zip(items, fetched, strict=True):
+        if img and _usable(img.data, 400):
+            out.append(_Candidate(data=img.data, mime=img.mime, kind="ref", source_url=page_url or u,
+                                  credit=credit[:120], caption=query))
+    return out
+
+
+def _landscape(data: bytes, min_w: int = 800) -> bool:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return img.width >= min_w and img.width / img.height >= 1.15
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _hero_fallback(ctx: _Ctx, v: Visual) -> list[_Candidate]:
+    """Hero without an image model: the brand's product/site image, else a credited season/mood image."""
+    out: list[_Candidate] = []
+    for url in ctx.product_images:
+        path = resolve_media(url)
+        if path:
+            data = path.read_bytes()
+            if _landscape(data, 700):
+                out.append(_Candidate(data=data, mime="image/jpeg", kind="ref", source_url="",
+                                      credit="Brand website image"))
+    # Real season photos from Wikimedia Commons (freely licensed, large, no watermark) ...
+    if ctx.season_photo_query:
+        out += await _commons_images(ctx, ctx.season_photo_query)
+    # ... then web images for the season mood, landscape only.
+    if len(out) < 2:
+        queries = [q for q in (ctx.season_hero_query, v.query) if q]
+        found = await asyncio.gather(*(_ref_candidates(ctx, Visual(want="ref", brief=q, query=q), kind="ref")
+                                       for q in queries[:2]))
+        for c in (c for batch in found for c in batch):
+            if _landscape(c.data, 800):
+                c.credit = (c.credit or "Ref").replace("Ref:", "Background:")
+                out.append(c)
+    return out
 
 
 # --- orchestration ----------------------------------------------------------
@@ -551,7 +660,8 @@ def _season_words(season: str | None) -> str:
     return ", ".join(sea.prompt.split(", ")[:3]) if sea else ""
 
 
-async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str, MemeTemplate]) -> None:
+async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str, MemeTemplate]
+                      ) -> tuple[list[MemeTemplate], set[str]]:
     """No template twice in a deck, none from the last few decks: swap for the best unused
     template with the same box count from a fresh shortlist (captions carry over)."""
     hints = [s.visual.brief or s.visual.query or "" for s in meme_slots]
@@ -560,6 +670,7 @@ async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str
         templates.setdefault(t.id, t)
     recent = recently_used(deck.brand)
     used: set[str] = set()
+    local = not (settings.imgflip_username and settings.imgflip_password)
     for slot in meme_slots:
         v = slot.visual
         boxes = [b for b in v.meme_boxes if b and b.strip()]
@@ -567,7 +678,8 @@ async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str
         if not boxes:
             continue
         current = templates.get(tid)
-        bad = (not current) or tid in used or tid in recent or (current and current.box_count < len(boxes))
+        bad = (not current) or tid in used or tid in recent or current.box_count < len(boxes) \
+            or (local and not captionable(current))
         if bad:
             repl = choose_replacement(current, current.box_count if current else len(boxes), used, recent,
                                       shortlist, v.brief or "")
@@ -578,93 +690,182 @@ async def _plan_memes(deck: Deck, meme_slots: list["_Slot"], templates: dict[str
                 v.meme_template_id = repl.id
                 tid = repl.id
         used.add(tid)
+    return shortlist, used
 
 
-def _select_slots(deck: Deck, budget: VisualBudget) -> list[_Slot]:
+EXTRA_MEMES = 6  # memes past the budget are still captioned locally (cheap, no API quota)
+EXTRA_REF_SEARCHES = 3  # leftover slots may run a few more image searches while time allows
+
+
+def _select_slots(deck: Deck, budget: VisualBudget) -> tuple[list[_Slot], list[_Slot]]:
+    """(budgeted slots, extra slots past the budget). The hero is attempted outside the budget."""
     left = {"ref": max(0, budget.ref), "meme": max(0, budget.meme), "mock": max(0, budget.mock)}
     slots: list[_Slot] = []
+    extra: list[_Slot] = []
     hero = deck.theme.hero_image
+    if hero is not None and _watermarked(hero):
+        hero.kind, hero.url, hero.credit, hero.source_url = "placeholder", None, None, None  # type: ignore[assignment]
     if hero is not None and not _already_filled(hero) and (hero.brief or hero.query):
-        slots.append(_Slot(visual=hero, want="mock", is_hero=True))  # one per deck, outside the budget
+        slots.append(_Slot(visual=hero, want="mock", is_hero=True))
     seen: set[int] = set()
     for slide in deck.slides:
         for v in _iter_visuals(slide):
             if id(v) in seen or _already_filled(v):
                 continue
             seen.add(id(v))
+            if _watermarked(v):  # refill instead of keeping a watermarked image
+                v.kind, v.url, v.credit, v.source_url = "placeholder", None, None, None  # type: ignore[assignment]
             want = v.want if v.want in left else "mock"
-            if left[want] > 0 and (v.brief or v.query or v.meme_boxes):
+            if not (v.brief or v.query or v.meme_boxes):
+                continue
+            if left[want] > 0:
                 left[want] -= 1
                 slots.append(_Slot(visual=v, want=want))
-    return slots
+            else:
+                extra.append(_Slot(visual=v, want=want))
+    return slots, extra
 
 
-async def attach_visuals(deck: Deck, budget: VisualBudget) -> Deck:
-    """Fill the deck's visual requests (incl. ``deck.theme.hero_image``) within ``budget``."""
-    deck = deck.model_copy(deep=True)
-    slots = _select_slots(deck, budget)
+def _spare_for(slot: _Slot, spares: list[_Candidate], used: set[str]) -> _Candidate | None:
+    """The unused candidate (gathered for another slot) that best matches this slot's brief."""
+    brief = f"{slot.visual.brief} {slot.visual.query or ''}"
+    best, best_score = None, -1
+    for c in spares:
+        if c.digest in used or c.kind == "meme":
+            continue
+        score = _relevance(brief, c.caption)
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def _assign(slot: _Slot, cand: _Candidate, used: set[str], filled: dict[str, int]) -> bool:
+    if cand.digest in used:
+        return False
+    try:
+        url = save_image(cand.data)
+    except ValueError:
+        return False
+    used.add(cand.digest)
+    v = slot.visual
+    v.kind = cand.kind  # type: ignore[assignment]
+    v.url = url
+    v.source_url = cand.source_url or None
+    v.credit = cand.credit or None
+    filled[cand.kind if cand.kind in filled else "mock"] += 1
+    return True
+
+
+async def _run_slots(ctx: _Ctx, slots: list[_Slot], deadline: float) -> None:
     if not slots:
+        return
+    tasks = [asyncio.create_task(asyncio.wait_for(_fill(ctx, s), SLOT_TIMEOUT)) for s in slots]
+    done, pending = await asyncio.wait(tasks, timeout=max(3.0, deadline - time.monotonic()))
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for t in done:
+        if not t.cancelled() and t.exception():
+            logger.info("visuals: slot timed out or failed: %s", t.exception().__class__.__name__)
+
+
+async def attach_visuals(deck: Deck, budget: VisualBudget, identity: Any = None) -> Deck:
+    """Fill the deck's visual requests (incl. ``deck.theme.hero_image``) within ``budget``.
+
+    Every slot falls back along: requested source -> web/Reddit ref for its brief -> an unused
+    image found for another slot -> the brand's product/site images. Memes past the budget are
+    still captioned locally. ``identity`` (a ``BrandIdentity``) is optional: without it the
+    identity cached for ``deck.brand`` is used, if any. Never raises for a single visual.
+    """
+    deck = deck.model_copy(deep=True)
+    slots, extra = _select_slots(deck, budget)
+    if not slots and not extra:
         return deck
     started = time.monotonic()
+    deadline = started + OVERALL_TIMEOUT
+    if identity is None:
+        from app.services.brand_identity import cached_identity
+
+        identity = cached_identity(deck.brand)
+    from app.services.brand_identity_season import get_season
+
+    sea = get_season(deck.theme.season)
 
     async with new_client(timeout=10) as client:
         templates: dict[str, MemeTemplate] = {}
         pulse: list[trends.TrendPost] = []
-        meme_slots = [s for s in slots if s.want == "meme"]
+        extra_memes = [s for s in extra if s.want == "meme"][:EXTRA_MEMES]
+        meme_slots = [s for s in slots if s.want == "meme"] + extra_memes
+        shortlist: list[MemeTemplate] = []
+        meme_used: set[str] = set()
         if meme_slots:
             templates = {t.id: t for t in await get_meme_templates()}
             try:
-                await asyncio.wait_for(_plan_memes(deck, meme_slots, templates), timeout=15)
+                shortlist, meme_used = await asyncio.wait_for(_plan_memes(deck, meme_slots, templates), timeout=15)
             except Exception as exc:  # noqa: BLE001 - keep the writer's templates
                 logger.info("visuals: meme planning skipped (%s)", exc.__class__.__name__)
-        if any(s.want in ("ref", "mock") for s in slots):
-            try:
-                pulse = (await asyncio.wait_for(trends.get_trend_pulse(), timeout=12)).posts
-            except Exception:
-                pulse = []
+        try:
+            pulse = (await asyncio.wait_for(trends.get_trend_pulse(), timeout=8)).posts
+        except Exception:  # noqa: BLE001
+            pulse = []
         ctx = _Ctx(
             client=client,
             tavily=AsyncTavilyClient(api_key=settings.tavily_api_key) if settings.tavily_api_key else None,
             pulse=pulse, templates=templates, theme_name=deck.theme.name,
             motif=deck.theme.motif or "", season_words=_season_words(deck.theme.season),
+            season_hero_query=(f"{sea.label} {', '.join(sea.prompt.split(', ')[1:3])} photo" if sea else ""),
+            season_photo_query=(sea.photo if sea else ""),
+            shortlist=shortlist, meme_used=meme_used,
+            product_images=list(getattr(identity, "product_images", []) or []),
         )
-        tasks = [asyncio.create_task(asyncio.wait_for(_fill(ctx, s), SLOT_TIMEOUT)) for s in slots]
-        remaining = max(5.0, OVERALL_TIMEOUT - (time.monotonic() - started))
-        done, pending = await asyncio.wait(tasks, timeout=remaining)
-        for t in pending:
-            t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for t in done:
-            if not t.cancelled() and t.exception():  # slot-level timeouts
-                logger.info("visuals: slot timed out or failed: %s", t.exception().__class__.__name__)
+        first = slots + extra_memes
+        await _run_slots(ctx, first, deadline)
 
-    # Assign in deck order so the same image is never used twice.
-    used: set[str] = set()
-    filled = {"ref": 0, "meme": 0, "mock": 0}
-    for slot in slots:
-        for cand in slot.candidates:
-            if cand.digest in used:
-                continue
-            try:
-                url = save_image(cand.data)
-            except ValueError:
-                continue
-            used.add(cand.digest)
-            v = slot.visual
-            v.kind = cand.kind  # type: ignore[assignment]
-            v.url = url
-            v.source_url = cand.source_url or None
-            v.credit = cand.credit or None
-            filled[cand.kind if cand.kind in filled else "mock"] += 1
-            break
-    meme_ids = [s.visual.meme_template_id for s in slots
+        used: set[str] = set()
+        filled = {"ref": 0, "meme": 0, "mock": 0}
+        for slot in first:  # assign in deck order so the same image is never used twice
+            for cand in slot.candidates:
+                if _assign(slot, cand, used, filled):
+                    break
+
+        # Leftovers (failed or past the budget): spare candidates, a few more searches, brand images.
+        leftovers = [s for s in first + [x for x in extra if x not in extra_memes]
+                     if s.visual.kind == "placeholder" and not s.is_hero]
+        spares = [c for s in first for c in s.candidates if c.digest not in used]
+        still: list[_Slot] = []
+        for slot in leftovers:
+            cand = _spare_for(slot, spares, used)
+            if not (cand and _assign(slot, cand, used, filled)):
+                still.append(slot)
+        searchable = [s for s in still if s.visual.brief or s.visual.query][:EXTRA_REF_SEARCHES]
+        if searchable and time.monotonic() < deadline - 5:
+            for s in searchable:
+                s.want = "ref"
+            await _run_slots(ctx, searchable, min(deadline, time.monotonic() + 15))
+            for slot in searchable:
+                for cand in slot.candidates:
+                    if _assign(slot, cand, used, filled):
+                        break
+        product_pool = [resolve_media(u) for u in ctx.product_images]
+        for slot in [s for s in still if s.visual.kind == "placeholder"]:
+            for path in product_pool:
+                if path is None:
+                    continue
+                data = path.read_bytes()
+                cand = _Candidate(data=data, mime="image/jpeg", kind="ref", source_url=getattr(identity, "site_url", "") or "",
+                                  credit="Brand website image")
+                if _assign(slot, cand, used, filled):
+                    break
+
+    meme_ids = [s.visual.meme_template_id for s in first
                 if s.want == "meme" and s.visual.kind == "meme" and s.visual.meme_template_id]
     if meme_ids:
         record_meme_use(deck.brand, meme_ids)
+    every = slots + extra
     logger.info(
-        "visuals: %d slots, filled ref=%d meme=%d mock=%d, %d left as placeholders, %.1fs",
-        len(slots), filled["ref"], filled["meme"], filled["mock"],
-        sum(1 for s in slots if s.visual.kind == "placeholder"), time.monotonic() - started,
+        "visuals: %d slots (%d past budget), filled ref=%d meme=%d mock=%d, %d left for brand tiles, %.1fs",
+        len(every), len(extra), filled["ref"], filled["meme"], filled["mock"],
+        sum(1 for s in every if s.visual.kind == "placeholder"), time.monotonic() - started,
     )
     return deck

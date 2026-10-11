@@ -265,6 +265,11 @@ def score_templates(templates: list[MemeTemplate], trend: dict[str, float], pena
     return out
 
 
+def captionable(t: MemeTemplate) -> bool:
+    """Can the local captioner draw this template well (no Imgflip account)?"""
+    return t.id in LAYOUTS or (not t.new and t.box_count <= 2)
+
+
 def template_image_urls(t: MemeTemplate) -> list[str]:
     """Candidate full-size image URLs (new Imgflip templates are often .png, not .jpg)."""
     urls = [t.url] if t.url else []
@@ -310,6 +315,11 @@ async def meme_shortlist(brand: str, bucket_hints: list[str], n: int = 20) -> li
         trend = await trend_scores(templates)
     except Exception:  # noqa: BLE001 - trends are optional
         trend = {}
+    if not (settings.imgflip_username and settings.imgflip_password):
+        # Without Imgflip's API we caption locally: only templates with measured boxes, or known
+        # classics whose 1-2 captions read well as top/bottom text. New templates often carry their
+        # own text or odd panels, so they wait for credentials.
+        templates = [t for t in templates if captionable(t)]
     scores = score_templates(templates, trend, recent_penalties(brand), bucket_hints)
     rnd = random.Random(time.time_ns())
     ranked = sorted(((scores[t.id], t) for t in templates), key=lambda x: -x[0])[:max(60, n * 3)]

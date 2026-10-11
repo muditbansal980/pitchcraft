@@ -173,7 +173,7 @@ def _hero_background(slide, ctx: Ctx, overlay: float, *, optional: bool = False)
     if optional and ctx.prev_hero:
         return False
     hero = ctx.deck.theme.hero_image
-    path = resolve_media(hero.url) if hero and hero.kind != "placeholder" else None
+    path = resolve_media(hero.url) if hero and hero.kind != "placeholder" and not _watermarked(hero) else None
     if not path:
         return False
     t = ctx.look.t
@@ -260,10 +260,19 @@ def _headline_runs(title: str, lk: Look) -> list[list[Run]]:
     return [[Run(title, lk.head_color)]]
 
 
+HEAD_FLOOR_PT = 14
+
+
 def _head_fit(ctx: Ctx, title: str, w: float, h: float, max_pt: float, min_pt: float, max_lines: int | None):
+    """Headline size that fits ``w`` x ``h`` in ``max_lines``. If even ``min_pt`` does not fit, keep
+    shrinking (down to 14pt): a smaller title beats one that runs into the strip below it."""
     lk = ctx.look
-    return fit_text(title, w, h, lk.hf, max_pt=max_pt, min_pt=min_pt, upper=lk.upper, bold=lk.head_bold,
-                    spacing=lk.head_spacing, max_lines=max_lines)
+    f = fit_text(title, w, h, lk.hf, max_pt=max_pt, min_pt=min_pt, upper=lk.upper, bold=lk.head_bold,
+                 spacing=lk.head_spacing, max_lines=max_lines)
+    if f.height > h + 1e-6 or (max_lines is not None and f.lines > max_lines):
+        f = fit_text(title, w, h, lk.hf, max_pt=f.size, min_pt=min(min_pt, HEAD_FLOOR_PT), upper=lk.upper,
+                     bold=lk.head_bold, spacing=lk.head_spacing, max_lines=max_lines)
+    return f
 
 
 def _headline(slide, ctx: Ctx, title: str, x: float, y: float, w: float, h: float, *, max_pt: float,
@@ -277,7 +286,7 @@ def _headline(slide, ctx: Ctx, title: str, x: float, y: float, w: float, h: floa
     used = min(h, f.height + 0.06)
     top = y if anchor == "top" else (y + h - used if anchor == "bottom" else y + (h - used) / 2)
     text(slide, x, top, w, used, _headline_runs(title, lk), font=lk.hf, size=f.size, color=lk.head_color,
-         bold=lk.head_bold, italic=lk.italic, align=align, spacing=lk.head_spacing, upper=lk.upper)
+         bold=lk.head_bold, italic=lk.italic, align=align, spacing=lk.head_spacing, upper=lk.upper, autofit=True)
     return top + used
 
 
@@ -323,7 +332,7 @@ def _visual(slide, ctx: Ctx, v: Visual | None, x: float, y: float, w: float, h: 
             frame: float = 2.0, tag: str | None = None, credit: bool = True) -> tuple[float, float, float, float]:
     """Image from the media store in an accent frame, or a styled "Sample visual" placeholder."""
     lk, t = ctx.look, ctx.look.t
-    path = resolve_media(v.url) if v is not None and v.kind != "placeholder" else None
+    path = _visual_path(v)
     rect = (x, y, w, h)
     if path:
         pic, rect = picture(slide, path, x, y, w, h, mode=mode)
@@ -336,20 +345,7 @@ def _visual(slide, ctx: Ctx, v: Visual | None, x: float, y: float, w: float, h: 
                 ctx.credits.append(" | ".join(p for p in (v.credit, v.source_url) if p))
     if not path:
         rect = (x, y, w, h)
-        ph = box(slide, x, y, w, h, t.surface, line=t.accent, line_w=1.25, dash=True)
-        ph.name = "Sample visual placeholder"
-        brief = ((v.brief or v.query) if v is not None else "") or "Visual to be designed"
-        inner = w - 0.5
-        small = w < 2.6 or h < 1.6
-        label_size = 9 if small else 11
-        brief, f = fit_or_clip(brief, inner, max(0.25, h - 0.75), lk.bf, max_pt=11 if small else 14, min_pt=8,
-                               spacing=1.3)
-        block = 0.38 + f.height
-        top = y + max(0.2, (h - block) / 2)
-        text(slide, x + 0.25, top, inner, 0.3, "SAMPLE VISUAL", font=lk.bf, size=label_size, color=t.accent,
-             bold=True, tracking=1.5, align="center")
-        text(slide, x + 0.25, top + 0.38, inner, min(h - 0.6, f.height + 0.1), brief, font=lk.bf, size=f.size,
-             color=t.muted, italic=True, align="center", spacing=1.3)
+        _brand_tile(slide, ctx, v, x, y, w, h)
     if tag:
         rx, ry, rw, _ = rect
         tw = measure(tag, 9, lk.bf, upper=True, bold=True) + 0.3
@@ -362,6 +358,53 @@ def _visual(slide, ctx: Ctx, v: Visual | None, x: float, y: float, w: float, h: 
             text(slide, rx, ry + rh + 0.06, rw, 0.2, v.credit[:80], font=lk.bf, size=7.5, color=t.muted,
                  align="center")
     return rect
+
+
+def _watermarked(v: Visual | None) -> bool:
+    """Anonymous Pollinations images carry a "pollinations.ai" watermark: never shown in a client deck."""
+    from app.core.config import settings
+    from app.services.visuals_http import watermarked_url
+
+    if v is None:
+        return False
+    anon_poll = (v.credit or "") == "AI mock (Pollinations)" and not getattr(settings, "pollinations_api_key", None)
+    return anon_poll or watermarked_url(v.source_url, v.credit)
+
+
+def _visual_path(v: Visual | None):
+    if v is None or v.kind == "placeholder" or _watermarked(v):
+        return None
+    return resolve_media(v.url)
+
+
+def _brand_tile(slide, ctx: Ctx, v: Visual | None, x: float, y: float, w: float, h: float) -> None:
+    """Last-resort visual: a designed brand tile (accent gradient, brand mark, small caption), never an
+    empty dashed box. The brief stays in the speaker notes for whoever produces the real visual."""
+    lk, t = ctx.look, ctx.look.t
+    tile = box(slide, x, y, w, h, t.accent)
+    set_gradient(tile, [(0, t.accent, 1), (1, mix(t.accent, t.bg, 0.55), 1)], 35)
+    tile.name = "Brand visual tile"
+    on = on_color(t.accent)
+    # Soft diagonal bands for texture.
+    for i in range(3):
+        band = box(slide, x + w * (0.15 + 0.3 * i), y, max(0.05, w * 0.08), h, on, alpha=0.06,
+                   shape=MSO_SHAPE.PARALLELOGRAM, adj=0.6)
+        band.name = "tile texture"
+    logo_w = _logo(slide, ctx, x + w * 0.2, y + h * 0.36, w * 0.6, min(h * 0.22, 0.9), align="center")
+    if logo_w is None:
+        name = (ctx.deck.brand or "").strip() or "Brand"
+        f = fit_text(name, w * 0.8, h * 0.3, lk.hf, max_pt=40, min_pt=12, upper=lk.upper, bold=lk.head_bold,
+                     spacing=1.0, max_lines=2)
+        text(slide, x + w * 0.1, y + (h - f.height) / 2 - 0.1, w * 0.8, f.height + 0.05, name, font=lk.hf,
+             size=f.size, color=on, bold=lk.head_bold, italic=lk.italic, upper=lk.upper, align="center",
+             spacing=1.0)
+    brief = ((v.brief or v.query) if v is not None else "") or ""
+    if brief and h > 1.3 and w > 1.6:
+        cap, cf = fit_or_clip(brief, w - 0.4, min(0.6, h * 0.22), lk.bf, max_pt=10, min_pt=7.5, spacing=1.25)
+        text(slide, x + 0.2, y + h - cf.height - 0.18, w - 0.4, cf.height + 0.05, cap, font=lk.bf, size=cf.size,
+             color=on, italic=True, align="center", spacing=1.25)
+    if brief:
+        ctx.credits.append(f"Visual to produce: {brief}")
 
 
 def _pill_w(item: str, size: float, font: str) -> float:
@@ -484,7 +527,7 @@ def build_from_to(slide, s: FromToSlide, ctx: Ctx) -> None:
     lk, t = ctx.look, ctx.look.t
     if not _hero_background(slide, ctx, overlay=0.86, optional=True):
         _background(slide, ctx)
-    y = _title_block(slide, ctx, s.title, s.strip, w=11.0, max_pt=66, y=0.8, h=1.5, align="center", max_lines=1)
+    y = _title_block(slide, ctx, s.title, s.strip, w=11.0, max_pt=66, y=0.6, h=1.5, align="center", max_lines=2)
     cw, gap = 5.15, 1.2
     x0 = (W - (2 * cw + gap)) / 2
     cy = max(y + 0.25, 3.25)
@@ -554,7 +597,8 @@ def build_card_grid(slide, s: CardGridSlide, ctx: Ctx) -> None:
     ch = H - cy - FOOT
     pad = 0.22
     inner = cw - 2 * pad
-    has_visual = any(c.visual is not None for c in cards)
+    # Image areas only when at least one card has a real image; otherwise text cards, not empty boxes.
+    has_visual = any(_visual_path(c.visual) is not None for c in cards)
     img_h = min(1.9, ch * 0.36) if has_visual else 0.0
     tag_size = 10.0
     max_tag_h = 2 * tag_size / 72 * 1.9 + 0.1
@@ -691,10 +735,11 @@ def build_idea(slide, s: IdeaSlide, ctx: Ctx) -> None:
     _footer(slide, ctx)
 
 
-def _grid(n: int, x: float, y: float, w: float, h: float, gap: float = 0.3) -> list[tuple[float, float, float, float]]:
+def _grid(n: int, x: float, y: float, w: float, h: float, gap: float = 0.3,
+          cols: int | None = None) -> list[tuple[float, float, float, float]]:
     if n <= 0:
         return []
-    cols = n if n <= 3 else (2 if n == 4 else 3)
+    cols = cols or (n if n <= 3 else (2 if n == 4 else 3))
     rows = math.ceil(n / cols)
     cw = (w - gap * (cols - 1)) / cols
     rh = (h - gap * (rows - 1)) / rows
@@ -736,7 +781,8 @@ def build_ref(slide, s: RefSlide, ctx: Ctx) -> None:
     else:
         y = _title_block(slide, ctx, s.title, "", max_pt=44)
         gx, gy, gw, gh = MX, y, CONTENT_W, H - y - FOOT - 0.15
-    for v, (x, y, w, h) in zip(vis, _grid(len(vis), gx, gy, gw, gh), strict=False):
+    cols = 2 if len(vis) >= 3 and gw < 8.5 else None  # beside the "why" text, 2 x 2 keeps images large
+    for v, (x, y, w, h) in zip(vis, _grid(len(vis), gx, gy, gw, gh, cols=cols), strict=False):
         _visual(slide, ctx, v, x, y, w, h - 0.3, mode="contain", frame=1.5, tag="Ref")
     _footer(slide, ctx)
 
@@ -967,16 +1013,21 @@ def build_fin(slide, s: FinSlide, ctx: Ctx) -> None:
         _background(slide, ctx, glow_side="left")
     title = (s.title or "").strip() or "Fin."
     f = fit_text(title, 11, 2.8, lk.hf, max_pt=160, min_pt=60, spacing=1.0, max_lines=2, bold=lk.head_bold)
+    if f.lines > 2 or f.height > 2.8:  # a long closing line: shrink instead of running into the logo
+        f = fit_text(title, 11, 2.6, lk.hf, max_pt=f.size, min_pt=20, spacing=1.0, max_lines=3, bold=lk.head_bold)
     sub_h = 0.7 if s.subtitle else 0
     y = (H - f.height - sub_h) / 2 - 0.2
     color = t.accent if contrast(t.accent, t.bg) >= 4.5 else t.text
     text(slide, (W - 11) / 2, y, 11, f.height + 0.1, title, font=lk.hf, size=f.size, color=color,
          bold=lk.head_bold, italic=lk.italic, align="center", spacing=1.0)
     if s.subtitle:
-        _body(slide, ctx, s.subtitle, (W - 9) / 2, y + f.height + 0.35, 9, 1.0, max_pt=20, min_pt=13,
+        sub_bottom = _body(slide, ctx, s.subtitle, (W - 9) / 2, y + f.height + 0.35, 9, 1.0, max_pt=20, min_pt=13,
               align="center", color=t.muted)
+    else:
+        sub_bottom = y + f.height
     brand = (ctx.deck.brand or "").upper()[:60]
-    if _logo(slide, ctx, MX, H - 1.45, CONTENT_W, 0.6, align="center") is None and brand:
+    logo_y = min(H - 1.0, max(H - 1.45, sub_bottom + 0.25))
+    if _logo(slide, ctx, MX, logo_y, CONTENT_W, min(0.6, H - 0.35 - logo_y), align="center") is None and brand:
         text(slide, MX, H - 1.05, CONTENT_W, 0.3, brand, font=lk.bf, size=11, color=t.muted, bold=True,
              align="center", tracking=3)
 

@@ -338,6 +338,7 @@ def text(
     tracking: float = 0.0,
     space_after: float = 0.0,
     wrap: bool = True,
+    autofit: bool = False,
 ):
     """A text box with zero insets. ``content`` is a string (``\\n`` = new paragraph) or paragraphs of Runs.
 
@@ -347,7 +348,8 @@ def text(
     tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(max(w, 0.1)), Inches(max(h, 0.1)))
     tf = tb.text_frame
     tf.word_wrap = wrap
-    tf.auto_size = MSO_AUTO_SIZE.NONE
+    # ``autofit``: shrink-on-overflow as a safety net when a viewer substitutes a wider font.
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE if autofit else MSO_AUTO_SIZE.NONE
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = Emu(0)
     tf.vertical_anchor = ANCHOR[anchor]
 

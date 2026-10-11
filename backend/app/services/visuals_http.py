@@ -28,6 +28,20 @@ _OG_IMAGE_RE = re.compile(
 )
 
 
+# Stock libraries whose previews carry a visible watermark: never used in a client deck.
+WATERMARK_HOSTS = (
+    "dreamstime.com", "shutterstock.com", "alamy.com", "istockphoto.com", "gettyimages", "123rf.com",
+    "depositphotos.com", "ftcdn.net", "stock.adobe.com", "vecteezy.com", "canstockphoto", "bigstockphoto",
+    "pond5.com", "agefotostock", "colourbox", "stockfreeimages", "megapixl", "pixtastock", "photodune",
+    "envato", "storyblocks", "fotosearch", "featurepics", "stocksy", "masterfile", "superstock", "pngtree.com",
+)
+
+
+def watermarked_url(*urls: str | None) -> bool:
+    """True if any URL points at a stock library known to watermark its previews."""
+    return any(u and any(h in u.lower() for h in WATERMARK_HOSTS) for u in urls)
+
+
 @dataclass(frozen=True)
 class FetchedImage:
     data: bytes
